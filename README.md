@@ -5,7 +5,7 @@ Official Go SDK for [AuthFI](https://authfi.io) — the identity control plane.
 ## Install
 
 ```bash
-go get github.com/queflyhq/authfi-go-sdk
+go get github.com/authfi/authfi-go-sdk
 ```
 
 ## Quick Start
@@ -15,7 +15,7 @@ package main
 
 import (
     "net/http"
-    authfi "github.com/queflyhq/authfi-go-sdk"
+    authfi "github.com/authfi/authfi-go-sdk"
 )
 
 func main() {
