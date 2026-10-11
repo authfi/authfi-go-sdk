@@ -1,3 +1,3 @@
-module github.com/queflyhq/authfi-go-sdk
+module github.com/authfi/authfi-go-sdk
 
 go 1.21
