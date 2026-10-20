@@ -421,6 +421,9 @@ func TestAnErrorThatOnlyStartsWithTheSameWordsIsNotAHold(t *testing.T) {
 		"Waiting for approval from your manager timed out",
 		"waiting for approval service to start: connection refused",
 		"Waiting for approval",
+		"Waiting for approval failed (timeout)",
+		"Waiting for approval from (admin) timed out",
+		"Waiting for approval aborted (cancelled)",
 	} {
 		if o := ReadResult(ToolResult{IsError: true, Text: text}); o.Kind != Result || o.Text != text {
 			t.Errorf("%q: %+v", text, o)

@@ -100,7 +100,8 @@ func ReadResult(r ToolResult) Outcome {
 			ApprovalID:    id,
 		}
 	}
-	if m := holdText.FindStringSubmatch(strings.TrimSpace(r.Text)); m != nil {
+	// An approval id has a digit, an underscore or a hyphen in it; "failed (timeout)" is an error.
+	if m := holdText.FindStringSubmatch(strings.TrimSpace(r.Text)); m != nil && strings.ContainsAny(m[1], "0123456789_-") {
 		return Outcome{Kind: Held, ApprovalID: m[1], Code: m[2]}
 	}
 	return Outcome{Kind: Result, Text: r.Text}
