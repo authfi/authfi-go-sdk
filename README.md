@@ -69,7 +69,34 @@ Errors that carry a server's reply have every secret and every JWT-shaped string
 - `RequireRole("admin")` middleware: role-based access
 - `Authenticate` middleware: token only, no permission check
 - Cloud credentials (GCP/AWS/Azure/OCI)
-- Zero external dependencies: stdlib only
+- Verification uses the standard library only; the `agent` package adds `golang.org/x/oauth2` and the OpenTelemetry trace API
+
+## Agents
+
+`github.com/authfi/authfi-go-sdk/agent` is the agent side: an agent signs a short assertion with its own key (Ed25519 by default, ES256 and PS256 too), gets its own token, and acts for a person through CIBA or token exchange.
+
+```go
+key, _ := agent.LoadKey("/run/secrets/agent.key", "") // refuses a file others can read
+a, _ := agent.New("https://acme.authfi.io", "agt_...", key, agent.WithResource("my-api-client-id"))
+
+tok, err := a.Token(ctx) // cached, renewed a minute before expiry, a fresh assertion per mint
+
+// For a person, with their approval on their own device:
+req, _ := a.RequestUserApproval(ctx, "jane@acme.com", "Refund order 4411", []string{"orders.refund"}, 2*time.Minute)
+delegated, err := a.AwaitUserToken(ctx, req) // honours slow_down; a denial returns at once
+
+// Or from a token your user already holds:
+delegated, err := a.Exchange(ctx, authfi.NewSecret(userToken), nil, "my-api-client-id")
+
+// Any http.Client (the Anthropic Go SDK, LangChainGo, the MCP Go SDK) can use the current token,
+// sent only to the origins you name:
+rt, _ := agent.Transport(a.TokenSource(), nil, "https://acme.authfi.io")
+client := &http.Client{Transport: rt}
+```
+
+The key, every token, every assertion and the CIBA handle print redacted and never appear in an error. `agent.ReadResult` reads the gateway's answer to a tool call as a result, a refusal or a hold, and `agent.WithApproval` sends a held call again once a person has decided.
+
+A refusal is a `*agent.TokenError` with the OAuth `Code` (`invalid_client`, `access_denied`, `expired_token`, ...) and is not retried. A network failure while minting is retried twice with a fresh assertion; a request that creates state (CIBA, exchange) is never sent twice. `LoadKey` checks file modes on Linux and macOS only.
 
 ## Cloud Credentials
 
