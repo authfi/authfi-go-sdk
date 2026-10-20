@@ -551,13 +551,11 @@ func TestACallerGivingUpDoesNotStartTheRenewalBackoff(t *testing.T) {
 		<-ctx.Done()
 		return Token{}, ctx.Err()
 	}, func() time.Time { return now })
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	_, _ = d.Token(ctx)
-	_, _ = d.Token(ctx)
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel2()
-	_, _ = d.Token(ctx2)
+	for i := 0; i < 3; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		_, _ = d.Token(ctx)
+		cancel()
+	}
 	if renewals.Load() != 3 {
 		t.Fatalf("a caller's deadline is not the platform failing: renewals %d, want 3", renewals.Load())
 	}
