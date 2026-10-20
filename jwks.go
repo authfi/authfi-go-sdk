@@ -46,74 +46,121 @@ func (k verifyKey) allows(alg string) bool {
 	return false
 }
 
-// keySet caches the issuer's key set. Reads take the fast path; a refresh is serialised so a
-// burst of requests costs one fetch.
+// keySet caches the key set of the issuer. Reads take the fast path. A fetch runs on its own
+// goroutine with its own deadline, one at a time: callers wait for it or leave on their own context,
+// and a caller that leaves does not cancel it, so dropped connections cannot turn into repeated
+// fetches against the issuer.
 type keySet struct {
-	url    string
-	ttl    time.Duration
-	client *http.Client
-	now    func() time.Time
+	url     string
+	ttl     time.Duration
+	timeout time.Duration
+	client  *http.Client
+	now     func() time.Time
 
 	mu        sync.RWMutex
 	keys      map[string]verifyKey
 	fetched   time.Time
 	attempted time.Time
 	failure   error // why the last attempt failed; nil when it succeeded
-
-	fetchMu sync.Mutex
+	flight    *flight
 }
+
+// flight is one fetch in progress; err is set before done is closed.
+type flight struct {
+	done chan struct{}
+	err  error
+}
+
+func noSuchKey() *Error { return refuse(CodeUnknownKey, "the key set of the issuer has no such key") }
 
 func (s *keySet) get(ctx context.Context, kid string) (verifyKey, error) {
 	if k, ok := s.fresh(kid); ok {
 		return k, nil
 	}
-	s.fetchMu.Lock()
-	defer s.fetchMu.Unlock()
-	if k, ok := s.fresh(kid); ok { // another request refreshed while this one waited
-		return k, nil
+	s.mu.Lock()
+	f := s.flight
+	if f == nil {
+		// One attempt per minRefetch, whatever came of the last one. This bounds what forged kids,
+		// an expired cache and a down issuer can cost the issuer: not one fetch per request. A
+		// failure is remembered for that interval, even if the issuer recovers inside it.
+		if s.now().Sub(s.attempted) < minRefetch {
+			k, ok := s.staleLocked(kid)
+			failure := s.failure
+			s.mu.Unlock()
+			switch {
+			case ok:
+				return k, nil
+			case failure != nil:
+				return verifyKey{}, failure
+			}
+			return verifyKey{}, noSuchKey()
+		}
+		f = s.startLocked()
 	}
-	// One attempt per minRefetch, whatever came of the last one. This bounds what forged kids, an
-	// expired cache and a down issuer can cost the issuer: not one fetch per request.
-	if s.now().Sub(s.lastAttempt()) < minRefetch {
-		if k, ok := s.stale(kid); ok {
-			return k, nil
-		}
-		if err := s.lastFailure(); err != nil {
-			return verifyKey{}, err
-		}
-		return verifyKey{}, refuse(CodeUnknownKey, "the issuer's key set has no such key")
+	s.mu.Unlock()
+	return s.await(ctx, f, kid)
+}
+
+// load fetches now, unless a fetch is already running (Start).
+func (s *keySet) load(ctx context.Context) error {
+	s.mu.Lock()
+	f := s.flight
+	if f == nil {
+		f = s.startLocked()
 	}
-	if err := s.refresh(ctx); err != nil {
-		if k, ok := s.stale(kid); ok {
-			return k, nil
-		}
-		return verifyKey{}, err
+	s.mu.Unlock()
+	select {
+	case <-f.done:
+		return f.err
+	case <-ctx.Done():
+		return &Error{Code: CodeKeySetUnavailable, Message: "the request ended before the key set arrived", Err: ctx.Err()}
+	}
+}
+
+func (s *keySet) await(ctx context.Context, f *flight, kid string) (verifyKey, error) {
+	select {
+	case <-f.done:
+	case <-ctx.Done():
+		return verifyKey{}, &Error{Code: CodeKeySetUnavailable, Message: "the request ended before the key set arrived", Err: ctx.Err()}
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if f.err != nil {
+		if k, ok := s.staleLocked(kid); ok {
+			return k, nil
+		}
+		return verifyKey{}, f.err
+	}
 	k, ok := s.keys[kid]
 	if !ok {
-		return verifyKey{}, refuse(CodeUnknownKey, "the issuer's key set has no such key")
+		return verifyKey{}, noSuchKey()
 	}
 	return k, nil
 }
 
-func (s *keySet) lastAttempt() time.Time {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.attempted
+// startLocked begins a fetch. s.mu must be held for writing and no fetch may be running.
+func (s *keySet) startLocked() *flight {
+	f := &flight{done: make(chan struct{})}
+	s.flight, s.attempted = f, s.now()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
+		defer cancel()
+		keys, err := s.fetch(ctx)
+		s.mu.Lock()
+		if err != nil {
+			s.failure = err
+		} else {
+			s.keys, s.fetched, s.failure = keys, s.now(), nil
+		}
+		f.err, s.flight = err, nil
+		s.mu.Unlock()
+		close(f.done)
+	}()
+	return f
 }
 
-func (s *keySet) lastFailure() error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.failure
-}
-
-// stale returns a cached key that is past its refresh time but within the grace period.
-func (s *keySet) stale(kid string) (verifyKey, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+// staleLocked returns a cached key that is past its refresh time but within the grace period.
+func (s *keySet) staleLocked(kid string) (verifyKey, bool) {
 	k, ok := s.keys[kid]
 	if !ok || s.now().Sub(s.fetched) >= s.ttl+staleGrace {
 		return verifyKey{}, false
@@ -131,32 +178,7 @@ func (s *keySet) fresh(kid string) (verifyKey, bool) {
 	return k, true
 }
 
-func (s *keySet) refresh(ctx context.Context) error {
-	s.mu.Lock()
-	previous := s.attempted
-	s.attempted = s.now()
-	s.mu.Unlock()
-
-	keys, err := s.fetch(ctx)
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err != nil {
-		if ctx.Err() != nil {
-			// The caller gave up; that says nothing about the issuer, so it is not an attempt.
-			s.attempted = previous
-			return &Error{Code: CodeKeySetUnavailable, Message: "the request ended before the key set arrived", Err: ctx.Err()}
-		}
-		s.failure = err
-		return err
-	}
-	s.keys, s.fetched, s.failure = keys, s.now(), nil
-	return nil
-}
-
 func (s *keySet) fetch(ctx context.Context) (map[string]verifyKey, error) {
-	ctx, cancel := context.WithTimeout(ctx, jwksFetchTimeout)
-	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.url, nil)
 	if err != nil {
 		return nil, &Error{Code: CodeKeySetUnavailable, Message: "the key set URL is invalid", Err: err}

@@ -35,6 +35,7 @@ type fixture struct {
 	status atomic.Int32 // when non-zero, the key set answers this status
 	empty  atomic.Bool  // when set, the key set holds no keys
 	big    atomic.Bool  // when set, the key set is larger than the SDK reads
+	delay  atomic.Int64 // nanoseconds the key set takes to answer
 
 	mu   sync.Mutex
 	keys map[string]*signer // by kid; all are published
@@ -103,6 +104,9 @@ func (f *fixture) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f.fetch.Add(1)
+	if d := f.delay.Load(); d > 0 {
+		time.Sleep(time.Duration(d))
+	}
 	st := int(f.status.Load())
 	f.mu.Lock()
 	defer f.mu.Unlock()

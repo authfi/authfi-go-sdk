@@ -1,6 +1,7 @@
 package authfi
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -32,6 +33,11 @@ func (s Secret) Reveal() string {
 		return ""
 	}
 	return *s.p
+}
+
+// Equal compares two secrets in constant time. Use it instead of ==, which compares the pointers.
+func (s Secret) Equal(o Secret) bool {
+	return subtle.ConstantTimeCompare([]byte(s.Reveal()), []byte(o.Reveal())) == 1
 }
 
 // IsEmpty reports whether no value is held.

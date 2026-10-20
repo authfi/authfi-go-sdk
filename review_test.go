@@ -381,3 +381,174 @@ func TestACappedNumberOfKeysLoad(t *testing.T) {
 		t.Fatalf("loaded %d keys, want the cap of %d", len(keys), jwksMaxKeys)
 	}
 }
+
+// --- round 2 ---
+
+// A caller that gives up must not make the next caller fetch again: the fetch is not tied to it.
+func TestCallersThatGiveUpDoNotMultiplyFetches(t *testing.T) {
+	f := newFixture(t)
+	f.delay.Store(int64(300 * time.Millisecond))
+	c := f.client()
+	for i := 0; i < 6; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+		_, err := c.Verify(ctx, f.mint(tokenSpec{header: map[string]any{"kid": fmt.Sprintf("forged-%d", i)}}))
+		cancel()
+		if i < 4 { // the 300 ms fetch is still running
+			mustCode(t, err, CodeKeySetUnavailable)
+		} else if err == nil {
+			t.Fatal("a forged kid must not verify")
+		}
+	}
+	time.Sleep(400 * time.Millisecond)
+	if n := f.fetch.Load(); n != 1 {
+		t.Fatalf("six callers with 60 ms deadlines cost %d fetches, want 1", n)
+	}
+	if _, err := c.VerifyToken(f.mint(tokenSpec{})); err != nil {
+		t.Fatalf("the fetch finished for the next caller: %v", err)
+	}
+}
+
+func TestAWaitingCallerLeavesOnItsOwnDeadline(t *testing.T) {
+	f := newFixture(t)
+	f.delay.Store(int64(1500 * time.Millisecond))
+	c := f.client()
+	go func() { _, _ = c.VerifyToken(f.mint(tokenSpec{})) }() // starts the slow fetch
+	time.Sleep(100 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := c.Verify(ctx, f.mint(tokenSpec{}))
+	mustCode(t, err, CodeKeySetUnavailable)
+	if took := time.Since(start); took > 700*time.Millisecond {
+		t.Fatalf("a caller with a 100 ms deadline waited %s", took)
+	}
+}
+
+func TestTheFetchHasItsOwnTimeout(t *testing.T) {
+	f := newFixture(t)
+	f.delay.Store(int64(600 * time.Millisecond))
+	c := f.client()
+	c.keys.timeout = 50 * time.Millisecond
+	start := time.Now()
+	_, err := c.VerifyToken(f.mint(tokenSpec{}))
+	mustCode(t, err, CodeKeySetUnavailable)
+	if time.Since(start) > 400*time.Millisecond {
+		t.Fatal("the fetch must give up at its own timeout")
+	}
+}
+
+func TestASuccessfulFetchClearsTheRememberedFailure(t *testing.T) {
+	f := newFixture(t)
+	f.status.Store(500)
+	c := f.client()
+	_, err := c.VerifyToken(f.mint(tokenSpec{}))
+	mustCode(t, err, CodeKeySetUnavailable)
+	f.status.Store(0)
+	f.advance(minRefetch + time.Second)
+	if _, err := c.VerifyToken(f.mint(tokenSpec{})); err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.VerifyToken(f.mint(tokenSpec{header: map[string]any{"kid": "forged"}}))
+	mustCode(t, err, CodeUnknownKey) // not the old outage
+}
+
+func TestStartAndVerifyMayRunTogether(t *testing.T) {
+	f := newFixture(t)
+	c := f.client()
+	tok := f.mint(tokenSpec{})
+	done := make(chan struct{})
+	for i := 0; i < 8; i++ {
+		go func(i int) {
+			defer func() { done <- struct{}{} }()
+			if i%2 == 0 {
+				_ = c.Start()
+				return
+			}
+			_, _ = c.VerifyToken(tok)
+		}(i)
+	}
+	for i := 0; i < 8; i++ {
+		<-done
+	}
+	if n := f.fetch.Load(); n < 1 || n > 2 {
+		t.Fatalf("fetches %d", n)
+	}
+}
+
+func TestSecretEqual(t *testing.T) {
+	if !NewSecret("a").Equal(NewSecret("a")) || NewSecret("a").Equal(NewSecret("b")) || NewSecret("a").Equal(Secret{}) || !(Secret{}).Equal(Secret{}) {
+		t.Fatal("Equal")
+	}
+}
+
+func TestBase64SegmentsRejectCRAndLFEverywhere(t *testing.T) {
+	f := newFixture(t)
+	c := f.client()
+	g := strings.Split(f.mint(tokenSpec{kid: "ed1"}), ".")
+	for _, ch := range []string{"\r", "\n", "\r\n"} {
+		for seg := 0; seg < 3; seg++ {
+			p := append([]string(nil), g...)
+			p[seg] = p[seg][:8] + ch + p[seg][8:]
+			if _, err := c.VerifyToken(strings.Join(p, ".")); err == nil {
+				t.Errorf("%q inside segment %d was skipped", ch, seg)
+			}
+		}
+	}
+}
+
+// --- the cloud calls, happy path ---
+
+func TestCloudCallsSendTheirCredentialsAndReturnWhatTheyAreGiven(t *testing.T) {
+	var seen http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Clone()
+		if strings.HasSuffix(r.URL.Path, "/token") {
+			_, _ = w.Write([]byte(`{"token":"oidc-token"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"access_key":"AK"}`))
+	}))
+	defer srv.Close()
+	c := New(secretConfig(srv.URL))
+	creds, err := c.CloudCredentials("user-token", "aws", map[string]string{"role": "r"})
+	if err != nil || creds["access_key"] != "AK" {
+		t.Fatalf("%v %v", creds, err)
+	}
+	if seen.Get("X-Client-Secret") != sentinelClientSecret || seen.Get("X-Client-Id") != "app_1" || seen.Get("Authorization") != "Bearer user-token" {
+		t.Fatalf("headers %v", seen)
+	}
+	tok, err := c.CloudToken("user-token", "aud", 60)
+	if err != nil || tok != "oidc-token" {
+		t.Fatalf("%q %v", tok, err)
+	}
+	if seen.Get("X-Client-Secret") != sentinelClientSecret {
+		t.Fatal("CloudToken sends the client secret")
+	}
+	for name, cfg := range map[string]Config{"no secret": {ApplicationID: "a", APIURL: srv.URL}, "no application": {ClientSecret: "s", APIURL: srv.URL}} {
+		if _, err := New(cfg).CloudCredentials("t", "aws", nil); err == nil {
+			t.Errorf("CloudCredentials with %s", name)
+		}
+		if _, err := New(cfg).CloudToken("t", "aud", 1); err == nil {
+			t.Errorf("CloudToken with %s", name)
+		}
+	}
+}
+
+func TestA3xxWithABodyIsNotASuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusFound)
+		_, _ = w.Write([]byte(`{"token":"x","access_key":"y","synced":1,"total":1}`))
+	}))
+	defer srv.Close()
+	c := New(secretConfig(srv.URL))
+	c.RegisterPermission("p", "")
+	if _, err := c.CloudCredentials("t", "aws", nil); err == nil {
+		t.Error("CloudCredentials")
+	}
+	if tok, err := c.CloudToken("t", "aud", 1); err == nil || tok != "" {
+		t.Error("CloudToken")
+	}
+	if err := c.Sync(); err == nil {
+		t.Error("Sync")
+	}
+}

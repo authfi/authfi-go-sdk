@@ -124,10 +124,11 @@ func New(cfg Config) *Client {
 	c.cfg.ClientSecret, c.cfg.APIKey = "", ""
 	c.cfgErr = checkConfig(c.cfg)
 	c.keys = &keySet{
-		url:    trimIssuer(cfg.Issuer) + jwksPath,
-		ttl:    cfg.JWKSRefresh,
-		client: cfg.HTTPClient,
-		now:    c.now,
+		url:     trimIssuer(cfg.Issuer) + jwksPath,
+		ttl:     cfg.JWKSRefresh,
+		timeout: jwksFetchTimeout,
+		client:  cfg.HTTPClient,
+		now:     c.now,
 	}
 	return c
 }
@@ -230,10 +231,7 @@ func (c *Client) Start() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), jwksFetchTimeout)
 	defer cancel()
-	c.keys.fetchMu.Lock()
-	err := c.keys.refresh(ctx)
-	c.keys.fetchMu.Unlock()
-	if err != nil {
+	if err := c.keys.load(ctx); err != nil {
 		return fmt.Errorf("authfi: JWKS fetch failed: %w", err)
 	}
 
