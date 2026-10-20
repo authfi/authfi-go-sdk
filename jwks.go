@@ -77,6 +77,9 @@ func (s *keySet) get(ctx context.Context, kid string) (verifyKey, error) {
 	if k, ok := s.fresh(kid); ok {
 		return k, nil
 	}
+	if err := ctx.Err(); err != nil { // a request that is already over starts nothing
+		return verifyKey{}, &Error{Code: CodeKeySetUnavailable, Message: "the request ended before the key set arrived", Err: err}
+	}
 	s.mu.Lock()
 	f := s.flight
 	if f == nil {
