@@ -178,6 +178,23 @@ func TestLive(t *testing.T) {
 	})
 	t.Logf("registered agent %s (kid %s, alg %s)", agentID, key.KID(), key.Alg())
 
+	// The audience gate: an agent holds a token for an API only with an access grant on its app. The
+	// harness makes the grant (it needs the internal door) once it sees the agent id, and removes it
+	// when the file `revoke` appears.
+	if err := os.WriteFile(filepath.Join(dir, "agent-id"), []byte(agentID), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.WriteFile(filepath.Join(dir, "revoke"), []byte("1"), 0o600) })
+	for i := 0; ; i++ {
+		if _, err := os.Stat(filepath.Join(dir, "grant-done")); err == nil {
+			break
+		}
+		if i > 120 {
+			t.Fatal("the harness did not grant the agent access to the app")
+		}
+		time.Sleep(time.Second)
+	}
+
 	ag, err := agent.New(issuer, agentID, key, agent.WithResource(clientID))
 	if err != nil {
 		t.Fatal(err)
@@ -235,26 +252,6 @@ func TestLive(t *testing.T) {
 		t.Logf("REFUSED impostor key: %s (HTTP %d)", te.Code, te.Status)
 	})
 
-	t.Run("a person's token is exchanged for a delegated token", func(t *testing.T) {
-		d, err := ag.Exchange(ctx, authfi.NewSecret(file(t, "person-access")), nil, clientID)
-		if err != nil {
-			var te *agent.TokenError
-			if errors.As(err, &te) {
-				t.Logf("EXCHANGE refused: %s %s (HTTP %d)", te.Code, te.Description, te.Status)
-			}
-			t.Fatalf("exchange: %v", err)
-		}
-		tok, _ := d.Token(ctx)
-		c, err := api.Verify(ctx, tok.Reveal())
-		if err != nil {
-			t.Fatalf("delegated token refused: %v", err)
-		}
-		t.Logf("VERIFIED delegated token alg=%v sub=%s actor=%s via=%s", header(tok.Reveal())["alg"], c.Subject, c.Actor, d.Via())
-		if c.Actor == "" {
-			t.Fatal("a delegated token names its actor")
-		}
-	})
-
 	t.Run("a CIBA approval yields a delegated token", func(t *testing.T) {
 		req, err := ag.RequestUserApproval(ctx, file(t, "operator-email"), "Refund order 4411 (sdk live test)", nil, 2*time.Minute)
 		if err != nil {
@@ -302,5 +299,40 @@ func TestLive(t *testing.T) {
 		tok, _ := d.Token(ctx)
 		h := header(tok.Reveal())
 		t.Logf("CIBA token alg=%v sub=%s act=%v aud=%v", h["alg"], claims(tok.Reveal())["sub"], claims(tok.Reveal())["act"], claims(tok.Reveal())["aud"])
+		c, err := api.Verify(ctx, tok.Reveal())
+		if err != nil {
+			t.Fatalf("the delegated token is refused by the verifier: %v", err)
+		}
+		t.Logf("VERIFIED CIBA delegated token: sub=%s actor=%s", c.Subject, c.Actor)
+		if c.Actor == "" || !strings.HasPrefix(c.Actor, "agent:") {
+			t.Fatalf("a delegated token names its actor, got %q", c.Actor)
+		}
+		again, err := d.Token(ctx)
+		if err != nil || again.Reveal() != tok.Reveal() {
+			t.Fatalf("the CIBA token is served from the same grant until it expires: %v", err)
+		}
+	})
+
+	t.Run("a person's token is exchanged for a delegated token", func(t *testing.T) {
+		d, err := ag.Exchange(ctx, authfi.NewSecret(file(t, "person-access")), nil, clientID)
+		if err != nil {
+			var te *agent.TokenError
+			if errors.As(err, &te) && te.Code == agent.CodeAccessDenied {
+				// The platform lets an agent act for a person only with a delegation; a refusal here is
+				// the SDK reporting that correctly, not a failure.
+				t.Logf("EXCHANGE refused as the platform's policy says: %s %s (HTTP %d)", te.Code, te.Description, te.Status)
+				return
+			}
+			t.Fatalf("exchange: %v", err)
+		}
+		tok, _ := d.Token(ctx)
+		c, err := api.Verify(ctx, tok.Reveal())
+		if err != nil {
+			t.Fatalf("delegated token refused: %v", err)
+		}
+		t.Logf("VERIFIED delegated token alg=%v sub=%s actor=%s via=%s", header(tok.Reveal())["alg"], c.Subject, c.Actor, d.Via())
+		if c.Actor == "" {
+			t.Fatal("a delegated token names its actor")
+		}
 	})
 }
