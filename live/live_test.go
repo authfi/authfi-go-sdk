@@ -45,13 +45,25 @@ func file(t *testing.T, name string) string {
 
 func gql(t *testing.T, query string, vars map[string]any) map[string]any {
 	t.Helper()
+	out, err := gqlErr(query, vars)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func gqlErr(query string, vars map[string]any) (map[string]any, error) {
 	body, _ := json.Marshal(map[string]any{"query": query, "variables": vars})
 	req, _ := http.NewRequest("POST", issuer+"/graphql", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+file(t, "console-token"))
+	tok, err := os.ReadFile(filepath.Join(dir, "console-token"))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(tok)))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
@@ -61,9 +73,9 @@ func gql(t *testing.T, query string, vars map[string]any) map[string]any {
 	}
 	_ = json.Unmarshal(raw, &out)
 	if resp.StatusCode != 200 || len(out.Errors) > 0 {
-		t.Fatalf("console API %d: %.200s", resp.StatusCode, authfi.Scrub(string(raw)))
+		return nil, fmt.Errorf("console API %d: %.200s", resp.StatusCode, authfi.Scrub(string(raw)))
 	}
-	return out.Data
+	return out.Data, nil
 }
 
 func header(tok string) map[string]any {
@@ -253,19 +265,30 @@ func TestLive(t *testing.T) {
 			t.Fatalf("request: %v", err)
 		}
 		t.Logf("CIBA requested, interval %s", req.Interval)
+		approved := make(chan string, 1)
 		go func() {
 			for i := 0; i < 20; i++ {
 				time.Sleep(time.Second)
-				list := gql(t, "{ myAgentRequests { authReqId agentId status bindingMessage } }", nil)["myAgentRequests"].([]any)
+				data, err := gqlErr("{ myAgentRequests { authReqId agentId status bindingMessage } }", nil)
+				if err != nil {
+					approved <- "error: " + err.Error()
+					return
+				}
+				list, _ := data["myAgentRequests"].([]any)
 				for _, r := range list {
-					m := r.(map[string]any)
+					m, _ := r.(map[string]any)
 					if m["agentId"] == agentID && m["status"] == "pending" {
-						gql(t, "mutation($a:ID!){ decideMyAgentRequest(authReqId:$a, decision:APPROVE){ status } }", map[string]any{"a": m["authReqId"]})
-						t.Logf("the operator approved %q", m["bindingMessage"])
+						_, err := gqlErr("mutation($a:ID!){ decideMyAgentRequest(authReqId:$a, decision:APPROVE){ status } }", map[string]any{"a": m["authReqId"]})
+						if err != nil {
+							approved <- "error: " + err.Error()
+							return
+						}
+						approved <- fmt.Sprintf("the operator approved %q", m["bindingMessage"])
 						return
 					}
 				}
 			}
+			approved <- "no pending request appeared"
 		}()
 		d, err := ag.AwaitUserToken(ctx, req)
 		if err != nil {
@@ -275,6 +298,7 @@ func TestLive(t *testing.T) {
 			}
 			t.Fatalf("await: %v", err)
 		}
+		t.Log(<-approved)
 		tok, _ := d.Token(ctx)
 		h := header(tok.Reveal())
 		t.Logf("CIBA token alg=%v sub=%s act=%v aud=%v", h["alg"], claims(tok.Reveal())["sub"], claims(tok.Reveal())["act"], claims(tok.Reveal())["aud"])

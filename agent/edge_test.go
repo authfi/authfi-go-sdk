@@ -78,7 +78,7 @@ func TestAccessorsAndOptions(t *testing.T) {
 	p := newPlatform(t, k)
 	custom := &http.Client{Timeout: time.Second}
 	a := p.agent(k, WithHTTPClient(custom))
-	if a.ID() != testAgentID || a.Issuer() != p.issuer() || a.http != custom {
+	if a.ID() != testAgentID || a.Issuer() != p.issuer() || a.http.Timeout != time.Second {
 		t.Fatal("accessors")
 	}
 	if !strings.Contains(a.GoString(), testAgentID) || strings.Contains(a.GoString(), "PRIVATE") {

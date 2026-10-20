@@ -55,6 +55,13 @@ type platform struct {
 	slept        []time.Duration
 	noInterval   bool   // the CIBA start omits the polling interval
 	asHits       int    // fetches of the authorization server metadata
+	redirectTo   string // the token endpoint answers 307 to this URL
+	cibaRedirect bool   // the CIBA start answers 307 to itself
+	configStatus int    // the agent configuration answers this status
+	approvalNoID bool   // the approval endpoint template has no {id}
+	cibaExpires  int    // expires_in of the CIBA start; default 300
+	cibaInterval any    // interval of the CIBA start; default 5
+	hugeValid    bool   // the token endpoint answers valid JSON larger than the SDK reads
 	hugeReply    bool   // the token endpoint answers more than the SDK reads
 	approvalHit  string // body served with a 500 on the approval endpoint
 }
@@ -120,9 +127,17 @@ func (p *platform) serve(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
+		if p.configStatus != 0 {
+			w.WriteHeader(p.configStatus)
+			return
+		}
+		approval := p.issuer() + "/approvals/{id}"
+		if p.approvalNoID {
+			approval = p.issuer() + "/approvals/fixed"
+		}
 		writeJSONTest(w, 200, map[string]any{
 			"backchannel_authentication_endpoint": p.issuer() + "/ciba",
-			"endpoints":                           map[string]string{"approval": p.issuer() + "/approvals/{id}"},
+			"endpoints":                           map[string]string{"approval": approval},
 		})
 	case "/oauth/token":
 		p.token(w, r)
@@ -239,6 +254,15 @@ func (p *platform) tokenReply(w http.ResponseWriter, claims map[string]any) {
 }
 
 func (p *platform) token(w http.ResponseWriter, r *http.Request) {
+	if p.redirectTo != "" {
+		http.Redirect(w, r, p.redirectTo, http.StatusTemporaryRedirect)
+		return
+	}
+	if p.hugeValid {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"x","token_type":"Bearer","expires_in":60,"scope":"` + strings.Repeat("a", 2<<20) + `"}`))
+		return
+	}
 	if p.hugeReply {
 		w.WriteHeader(200)
 		_, _ = w.Write(make([]byte, 2<<20))
@@ -293,6 +317,8 @@ func (p *platform) token(w http.ResponseWriter, r *http.Request) {
 			p.refuse(w, 400, "slow_down", "")
 		case "429":
 			p.refuse(w, 429, "too_many_requests", "")
+		case "echo-handle":
+			p.refuse(w, 400, form.Get("auth_req_id"), "")
 		case "denied":
 			p.refuse(w, 400, "access_denied", "")
 		case "expired":
@@ -315,8 +341,8 @@ func (p *platform) exchange(w http.ResponseWriter, form url.Values) {
 		p.refuse(w, 401, "invalid_client", "an exchange carries no client authentication")
 		return
 	}
-	if form.Get("subject_token") == "" || form.Get("actor_token") == "" || form.Get("subject_token") == "expired-subject" {
-		p.refuse(w, 400, "invalid_grant", "subject token "+form.Get("subject_token"))
+	if form.Get("subject_token") == "" || form.Get("actor_token") == "" || form.Get("subject_token") == "expired-subject" || strings.HasPrefix(form.Get("subject_token"), "bad/") {
+		p.refuse(w, 400, "invalid_grant", "subject token "+form.Get("subject_token")+" as form subject_token="+url.QueryEscape(form.Get("subject_token")))
 		return
 	}
 	p.tokenReply(w, map[string]any{"sub": "user:jane@example.com", "act": map[string]any{"sub": "agent:" + testAgentID}, "aud": p.issuer() + "/mcp"})
@@ -328,11 +354,23 @@ func (p *platform) ciba(w http.ResponseWriter, r *http.Request) {
 	p.mu.Lock()
 	p.backchannel = append(p.backchannel, form)
 	p.mu.Unlock()
+	if p.cibaRedirect {
+		http.Redirect(w, r, p.issuer()+"/ciba", http.StatusTemporaryRedirect)
+		return
+	}
 	if msg := p.checkAssertion(form); msg != "" {
 		p.refuse(w, 401, "invalid_client", msg)
 		return
 	}
-	body := map[string]any{"auth_req_id": "REQ-HANDLE-0001", "expires_in": 300, "interval": 5, "approval_url": p.issuer() + "/approve/x"}
+	exp := 300
+	if p.cibaExpires != 0 {
+		exp = p.cibaExpires
+	}
+	var interval any = 5
+	if p.cibaInterval != nil {
+		interval = p.cibaInterval
+	}
+	body := map[string]any{"auth_req_id": "REQ-HANDLE-0001", "expires_in": exp, "interval": interval, "approval_url": p.issuer() + "/approve/x"}
 	if p.noInterval {
 		delete(body, "interval")
 	}

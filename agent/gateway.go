@@ -70,7 +70,10 @@ func (o Outcome) ModelText() string {
 	return o.Text
 }
 
-var holdText = regexp.MustCompile(`^Waiting for approval ([A-Za-z0-9._:-]+) \(([a-z_]+)\)\. A person must approve this action`)
+// holdText matches the gateway's hold message at the start of an error result. It is lenient about
+// what the id looks like and about case, so a change of wording around the id still reads as a hold
+// and not as a plain error that would show the id to a model.
+var holdText = regexp.MustCompile(`(?i)^\s*waiting\s+for\s+approval\s+(\S+)(?:\s+\(([a-z_]+)\))?`)
 
 // ReadResult reads one tools/call result. Only an error result can be a refusal or a hold, so a
 // tool whose output quotes the gateway's words is still its own answer. A refusal is read from
@@ -80,12 +83,17 @@ func ReadResult(r ToolResult) Outcome {
 		return Outcome{Kind: Result, Text: r.Text}
 	}
 	if detail, ok := r.Meta[RefusalMeta].(map[string]any); ok {
+		id := str(detail, "approval_id")
+		reason := firstNonEmpty(str(detail, "reason"), str(detail, "error"))
+		if id != "" {
+			reason = strings.ReplaceAll(reason, id, "[approval]")
+		}
 		return Outcome{
 			Kind:          Refused,
 			Code:          str(detail, "code"),
-			Reason:        firstNonEmpty(str(detail, "reason"), str(detail, "error")),
+			Reason:        reason,
 			RequiredScope: str(detail, "required_scope"),
-			ApprovalID:    str(detail, "approval_id"),
+			ApprovalID:    id,
 		}
 	}
 	if m := holdText.FindStringSubmatch(strings.TrimSpace(r.Text)); m != nil {

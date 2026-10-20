@@ -208,12 +208,12 @@ func (k *Key) sign(data []byte) ([]byte, error) {
 	}
 }
 
-func (k *Key) String() string               { return fmt.Sprintf("agent.Key(kid=%s, alg=%s)", k.kid, k.alg) }
-func (k *Key) GoString() string             { return k.String() }
-func (k *Key) Format(f fmt.State, _ rune)   { _, _ = io.WriteString(f, k.String()) }
-func (k *Key) LogValue() slog.Value         { return slog.StringValue(k.String()) }
-func (k *Key) MarshalText() ([]byte, error) { return []byte(k.String()), nil }
-func (k *Key) MarshalJSON() ([]byte, error) {
+func (k Key) String() string               { return fmt.Sprintf("agent.Key(kid=%s, alg=%s)", k.kid, k.alg) }
+func (k Key) GoString() string             { return k.String() }
+func (k Key) Format(f fmt.State, _ rune)   { _, _ = io.WriteString(f, k.String()) }
+func (k Key) LogValue() slog.Value         { return slog.StringValue(k.String()) }
+func (k Key) MarshalText() ([]byte, error) { return []byte(k.String()), nil }
+func (k Key) MarshalJSON() ([]byte, error) {
 	return []byte(fmt.Sprintf(`{"kid":%q,"alg":%q}`, k.kid, k.alg)), nil
 }
 

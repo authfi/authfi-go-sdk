@@ -18,6 +18,9 @@ import (
 // more than five minutes.
 const assertionLifetime = 60 * time.Second
 
+// maxLifetime bounds a lifetime or an interval a server sends, in seconds.
+const maxLifetime = 365 * 24 * 3600
+
 // clientAssertion is an RFC 7523 section 2.2 assertion: iss and sub are the client, aud is the
 // endpoint that checks it, jti is fresh. It is a bearer credential for its lifetime, so one is
 // signed per request and never kept.
@@ -88,7 +91,7 @@ type Token struct {
 // Reveal returns the access token.
 func (t Token) Reveal() string { return t.secret.Reveal() }
 
-// Valid reports whether the token is set and not within skew of its expiry at now.
+// valid reports whether the token is set and not within skew of its expiry at now.
 func (t Token) valid(now time.Time, skew time.Duration) bool {
 	return !t.secret.IsEmpty() && now.Add(skew).Before(t.Expiry)
 }
@@ -132,6 +135,9 @@ func parseToken(status int, body []byte, now time.Time, secrets ...string) (Toke
 	if r.ExpiresIn <= 0 {
 		return Token{}, &TokenError{Code: "invalid_response", Description: "the token endpoint answered no lifetime", Status: status}
 	}
+	if r.ExpiresIn > maxLifetime {
+		r.ExpiresIn = maxLifetime // a lifetime past this overflows time.Duration, and no token lives a year
+	}
 	return Token{
 		secret: authfi.NewSecret(r.AccessToken),
 		Expiry: now.Add(time.Duration(r.ExpiresIn) * time.Second),
@@ -148,7 +154,9 @@ func tokenFailure(status int, body []byte, secrets ...string) *TokenError {
 	}
 	_ = json.Unmarshal(body, &e)
 	code := e.Code
-	if code == "" || len(code) > 64 || strings.ContainsAny(code, " \t\r\n\"") {
+	// The code is a short token by the OAuth rules. One that has anything else in it, or that held a
+	// secret the server echoed, is not a code.
+	if code == "" || len(code) > 64 || strings.ContainsAny(code, " \t\r\n\"") || authfi.Scrub(code, secrets...) != code {
 		code = fmt.Sprintf("http_%d", status)
 	}
 	return &TokenError{Code: code, Description: authfi.Scrub(e.Description, secrets...), Status: status}

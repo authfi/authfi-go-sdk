@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	authfi "github.com/authfi/authfi-go-sdk"
@@ -71,6 +70,9 @@ func (a *Agent) RequestUserApproval(ctx context.Context, loginHint, bindingMessa
 	if err != nil {
 		return nil, &TokenError{Code: "discovery_failed", Description: authfi.Scrub(err.Error()), Err: err}
 	}
+	if ep.configErr != nil {
+		return nil, &TokenError{Code: "discovery_failed", Description: authfi.Scrub(ep.configErr.Error()), Err: ep.configErr}
+	}
 	if ep.backchannel == "" {
 		return nil, &TokenError{Code: "unsupported", Description: "this project offers no user approval (CIBA) to agents"}
 	}
@@ -79,7 +81,8 @@ func (a *Agent) RequestUserApproval(ctx context.Context, loginHint, bindingMessa
 		fields.Set("scope", strings.Join(scope, " "))
 	}
 	if expiry > 0 {
-		fields.Set("requested_expiry", fmt.Sprint(int(expiry/time.Second)))
+		secs := int((expiry + time.Second - 1) / time.Second) // rounded up: under a second is not "none"
+		fields.Set("requested_expiry", fmt.Sprint(secs))
 	}
 	form, assertion, err := a.authForm(ep.token, fields)
 	if err != nil {
@@ -106,8 +109,11 @@ func (a *Agent) RequestUserApproval(ctx context.Context, loginHint, bindingMessa
 	if body.ExpiresIn <= 0 {
 		body.ExpiresIn = 300
 	}
+	if body.ExpiresIn > maxLifetime {
+		body.ExpiresIn = maxLifetime
+	}
 	interval := defaultInterval
-	if body.Interval > 0 {
+	if body.Interval >= 1 && body.Interval <= 300 { // under a second would be a hot loop; over five minutes is nonsense
 		interval = time.Duration(body.Interval * float64(time.Second))
 	}
 	return &CIBARequest{
@@ -237,7 +243,7 @@ func (a *Agent) Exchange(ctx context.Context, subject authfi.Secret, scope []str
 
 // DelegatedToken is a token for a person's delegation to this agent. It prints redacted.
 type DelegatedToken struct {
-	mu      sync.Mutex
+	sem     chan struct{} // one-slot lock that a context can leave
 	cur     Token
 	via     string
 	subject string
@@ -246,7 +252,7 @@ type DelegatedToken struct {
 }
 
 func newDelegated(t Token, via string, renew func(context.Context) (Token, error), now func() time.Time) *DelegatedToken {
-	return &DelegatedToken{cur: t, via: via, renew: renew, now: now, subject: labelSubject(t.Reveal())}
+	return &DelegatedToken{sem: make(chan struct{}, 1), cur: t, via: via, renew: renew, now: now, subject: labelSubject(t.Reveal())}
 }
 
 // Via is ViaCIBA or ViaExchange.
@@ -259,8 +265,13 @@ func (d *DelegatedToken) Subject() string { return d.subject }
 // Token returns the current token. An exchanged token is exchanged again within a minute of
 // expiry; a CIBA token is not renewed, and Token returns expired_token once it has run out.
 func (d *DelegatedToken) Token(ctx context.Context) (Token, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	if d == nil || d.sem == nil {
+		return Token{}, errors.New("agent: a DelegatedToken comes from AwaitUserToken or Exchange")
+	}
+	if err := acquire(ctx, d.sem); err != nil {
+		return Token{}, err
+	}
+	defer func() { <-d.sem }()
 	if d.cur.valid(d.now(), renewSkew) {
 		return d.cur, nil
 	}
@@ -272,6 +283,9 @@ func (d *DelegatedToken) Token(ctx context.Context) (Token, error) {
 	}
 	t, err := d.renew(ctx)
 	if err != nil {
+		if d.cur.valid(d.now(), 0) {
+			return d.cur, nil // the old token still works; the caller meets the refusal when it runs out
+		}
 		return Token{}, err
 	}
 	d.cur = t
@@ -305,8 +319,13 @@ func labelSubject(raw string) string {
 	var c struct {
 		Sub string `json:"sub"`
 	}
-	if json.Unmarshal(b, &c) != nil || len(c.Sub) > 256 || strings.ContainsAny(c.Sub, "\r\n") {
+	if json.Unmarshal(b, &c) != nil || len(c.Sub) > 256 {
 		return ""
+	}
+	for _, r := range c.Sub {
+		if r < 0x20 || r == 0x7f {
+			return "" // a label that reaches a log or a terminal carries no control characters
+		}
 	}
 	return c.Sub
 }

@@ -31,12 +31,15 @@ func (p Approval) Pending() bool { return p.Status == "" || p.Status == "pending
 
 // ApprovalStatus reads approval id with the agent's own token.
 func (a *Agent) ApprovalStatus(ctx context.Context, id string) (Approval, error) {
-	if strings.TrimSpace(id) == "" {
+	if strings.TrimSpace(id) == "" || id == "." || id == ".." {
 		return Approval{}, errors.New("agent: the approval id is required")
 	}
 	ep, err := a.endpoints(ctx)
 	if err != nil {
 		return Approval{}, &TokenError{Code: "discovery_failed", Description: authfi.Scrub(err.Error()), Err: err}
+	}
+	if ep.configErr != nil {
+		return Approval{}, &TokenError{Code: "discovery_failed", Description: authfi.Scrub(ep.configErr.Error()), Err: ep.configErr}
 	}
 	if ep.approval == "" || !strings.Contains(ep.approval, "{id}") {
 		return Approval{}, ErrApprovalStatusNotOffered

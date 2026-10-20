@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -75,8 +76,12 @@ const maxEchoed = 512
 // anything a server sent back, because a misbehaving server can echo what it was given.
 func Scrub(text string, secrets ...string) string {
 	for _, s := range secrets {
-		if len(s) >= 4 {
-			text = strings.ReplaceAll(text, s, redacted)
+		if len(s) < 4 {
+			continue
+		}
+		// A server may echo a value as it arrived in a form body: percent-encoded.
+		for _, form := range []string{s, url.QueryEscape(s), url.PathEscape(s)} {
+			text = strings.ReplaceAll(text, form, redacted)
 		}
 	}
 	text = jwtShape.ReplaceAllString(text, redacted)

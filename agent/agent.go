@@ -56,7 +56,15 @@ type discovered struct {
 	token       string
 	backchannel string
 	approval    string
+	// configErr is why the agent configuration could not be read (not why it is absent). While it
+	// is set the result is not cached, and what depends on the configuration reports it.
+	configErr error
 }
+
+// statusError is an HTTP status that was not 200.
+type statusError struct{ code int }
+
+func (e statusError) Error() string { return fmt.Sprintf("HTTP %d", e.code) }
 
 // Option configures New.
 type Option func(*Agent)
@@ -96,6 +104,11 @@ func New(issuer, agentID string, key *Key, opts ...Option) (*Agent, error) {
 	for _, o := range opts {
 		o(a)
 	}
+	// Whatever client is given, this copy never follows a redirect: an assertion, a handle or a
+	// subject token in a request body must not be resent, and not to another host.
+	c := *a.http
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	a.http = &c
 	return a, nil
 }
 
@@ -148,7 +161,7 @@ func (a *Agent) endpoints(ctx context.Context) (discovered, error) {
 		return discovered{}, err
 	}
 	defer func() { <-a.discSem }()
-	if a.disc.token != "" && a.now().Sub(a.discTime) < endpointsTTL {
+	if a.disc.token != "" && a.disc.configErr == nil && a.now().Sub(a.discTime) < endpointsTTL {
 		return a.disc, nil
 	}
 	var as struct {
@@ -174,11 +187,15 @@ func (a *Agent) endpoints(ctx context.Context) (discovered, error) {
 		} `json:"endpoints"`
 	}
 	// The agent configuration is optional: a project without it has no approvals for agents.
-	if err := a.getJSON(ctx, a.issuer+"/.well-known/agent-configuration", "", &ac); err == nil {
+	switch err := a.getJSON(ctx, a.issuer+"/.well-known/agent-configuration", "", &ac); {
+	case err == nil:
 		if d.backchannel == "" {
 			d.backchannel = ac.Backchannel
 		}
 		d.approval = ac.Endpoints.Approval
+	case isStatus(err, http.StatusNotFound):
+	default:
+		d.configErr = err
 	}
 	if d.backchannel != "" {
 		if d.backchannel, err = a.sameHost(d.backchannel, "backchannel_authentication_endpoint"); err != nil {
@@ -194,10 +211,15 @@ func (a *Agent) endpoints(ctx context.Context) (discovered, error) {
 	return d, nil
 }
 
+func isStatus(err error, code int) bool {
+	var se statusError
+	return errors.As(err, &se) && se.code == code
+}
+
 func (a *Agent) sameHost(raw, what string) (string, error) {
 	u, err := url.Parse(raw)
 	base, _ := url.Parse(a.issuer)
-	if raw == "" || err != nil || u.Scheme != base.Scheme || u.Host != base.Host {
+	if raw == "" || err != nil || u.Scheme != base.Scheme || u.Host != base.Host || u.User != nil || u.Fragment != "" {
 		return "", fmt.Errorf("agent: discovery: %s is missing or not on the issuer's host", what)
 	}
 	return raw, nil
@@ -246,7 +268,7 @@ func (a *Agent) getJSON(ctx context.Context, rawURL, bearer string, into any) er
 		return err
 	}
 	if r.status != http.StatusOK {
-		return fmt.Errorf("HTTP %d", r.status)
+		return statusError{r.status}
 	}
 	if err := json.Unmarshal(r.body, into); err != nil {
 		return errors.New("the reply is not JSON")

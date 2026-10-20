@@ -54,14 +54,20 @@ func Transport(src oauth2.TokenSource, base http.RoundTripper, sendTo ...string)
 
 func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if !t.origins[req.URL.Scheme+"://"+req.URL.Host] {
+		closeBody(req)
 		return nil, ErrDestinationNotAllowed
 	}
 	tok, err := t.src.Token()
 	if err != nil {
+		closeBody(req)
 		return nil, err
 	}
 	out := req.Clone(req.Context()) // a RoundTripper must not modify the caller's request
-	out.Header.Del("X-Api-Key")
+	for k := range out.Header {
+		if strings.EqualFold(k, "x-api-key") || strings.EqualFold(k, "authorization") {
+			delete(out.Header, k) // a header set without canonical casing would otherwise survive
+		}
+	}
 	out.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 	if sc := trace.SpanContextFromContext(req.Context()); sc.IsValid() {
 		if out.Header.Get("traceparent") == "" {
@@ -72,4 +78,11 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 	return t.base.RoundTrip(out)
+}
+
+// closeBody closes a request body the transport will not send: RoundTripper must always close it.
+func closeBody(req *http.Request) {
+	if req.Body != nil {
+		_ = req.Body.Close()
+	}
 }
