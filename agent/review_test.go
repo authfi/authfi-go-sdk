@@ -75,6 +75,7 @@ func TestAFailedAgentConfigurationIsNotCachedAsAbsent(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 	p.configStatus = 0
+	p.advance(2 * time.Minute)
 	if _, err := a.RequestUserApproval(context.Background(), "jane", "msg", nil, 0); err != nil {
 		t.Fatalf("the configuration is back: %v", err)
 	}
@@ -154,13 +155,24 @@ func TestAnAbsurdLifetimeIsClamped(t *testing.T) {
 }
 
 func TestCIBAIntervalIsKeptInSaneBounds(t *testing.T) {
-	for name, v := range map[string]any{"zero": 0, "fraction": 0.2, "huge": 1e30, "negative": -3, "five minutes plus": 301} {
+	for name, c := range map[string]struct {
+		in   any
+		want time.Duration
+	}{
+		"absent":            {0, 5 * time.Second},
+		"negative":          {-3, 5 * time.Second},
+		"fraction":          {0.2, time.Second},
+		"one second":        {1, time.Second},
+		"five minutes":      {300, 300 * time.Second},
+		"over five minutes": {600, 300 * time.Second},
+		"huge":              {1e30, 300 * time.Second},
+	} {
 		k := keyFor(t, EdDSA)
 		p := newPlatform(t, k)
-		p.cibaInterval = v
+		p.cibaInterval = c.in
 		req, err := p.agent(k).RequestUserApproval(context.Background(), "jane", "msg", nil, 0)
-		if err != nil || req.Interval != 5*time.Second {
-			t.Errorf("%s: interval %v %v", name, req, err)
+		if err != nil || req.Interval != c.want {
+			t.Errorf("%s: interval %v %v, want %s", name, req, err, c.want)
 		}
 	}
 	k := keyFor(t, EdDSA)
@@ -395,12 +407,36 @@ func TestAHoldIsAHoldWhateverTheIDLooksLike(t *testing.T) {
 	for _, text := range []string{
 		"Waiting for approval apr/1+2 (approval_required). A person must approve",
 		"  waiting   for approval   APR_9 (APPROVAL_REQUIRED). A person",
-		"Waiting for approval apr_1",
+		"Waiting for approval apr_1. A person must approve this action in the AuthFI console.",
 	} {
 		o := ReadResult(ToolResult{IsError: true, Text: text})
 		if o.Kind != Held || o.ApprovalID == "" || o.ModelText() != HoldMessage {
 			t.Errorf("%q: %+v", text, o)
 		}
+	}
+}
+
+func TestAnErrorThatOnlyStartsWithTheSameWordsIsNotAHold(t *testing.T) {
+	for _, text := range []string{
+		"Waiting for approval from your manager timed out",
+		"waiting for approval service to start: connection refused",
+		"Waiting for approval",
+	} {
+		if o := ReadResult(ToolResult{IsError: true, Text: text}); o.Kind != Result || o.Text != text {
+			t.Errorf("%q: %+v", text, o)
+		}
+	}
+	o := ReadResult(ToolResult{IsError: true, Text: "Waiting for approval apr_1. A person must approve this action"})
+	if o.Kind != Held || o.ApprovalID != "apr_1" {
+		t.Fatalf("trailing punctuation is not part of the id: %+v", o)
+	}
+}
+
+func TestARefusalNeverCarriesTheApprovalIDInAnyCaseOrCount(t *testing.T) {
+	o := ReadResult(ToolResult{IsError: true, Meta: map[string]any{RefusalMeta: map[string]any{
+		"code": "denied_APR_9", "reason": "approval apr_9 was denied; see APR_9 and apr_9 again", "approval_id": "apr_9"}}})
+	if text := strings.ToLower(o.ModelText() + o.Code + o.Reason); strings.Contains(text, "apr_9") {
+		t.Fatalf("%q", o.ModelText())
 	}
 }
 
@@ -422,5 +458,104 @@ func TestACIBAExpiryThatOverflowsIsClamped(t *testing.T) {
 	}
 	if req.ExpiresAt.Before(p.clock()) || req.ExpiresAt.After(p.clock().Add(400*24*time.Hour)) {
 		t.Fatalf("expires %s", req.ExpiresAt)
+	}
+}
+
+func TestAConfigurationOutageDoesNotBlockWhatTheMetadataAlreadyNames(t *testing.T) {
+	k := keyFor(t, EdDSA)
+	p := newPlatform(t, k)
+	p.configStatus = 500
+	p.backchannelInMetadata = true
+	a := p.agent(k)
+	if _, err := a.RequestUserApproval(context.Background(), "jane", "msg", nil, 0); err != nil {
+		t.Fatalf("the authorization server metadata names the endpoint: %v", err)
+	}
+}
+
+func TestAConfigurationOutageIsRetriedAtMostOncePerMinute(t *testing.T) {
+	k := keyFor(t, EdDSA)
+	p := newPlatform(t, k)
+	p.configStatus = 500
+	a := p.agent(k)
+	for i := 0; i < 20; i++ {
+		_, _ = a.ApprovalStatus(context.Background(), "a")
+	}
+	if p.asHits != 1 {
+		t.Fatalf("20 calls during an outage fetched the metadata %d times, want 1", p.asHits)
+	}
+	p.advance(2 * time.Minute)
+	_, _ = a.ApprovalStatus(context.Background(), "a")
+	if p.asHits != 2 {
+		t.Fatalf("after a minute it tries again: %d", p.asHits)
+	}
+}
+
+func TestAFailedRenewalIsNotRetriedOnEveryCallAndNeverServesAnExpiredToken(t *testing.T) {
+	var renewals atomic.Int32
+	now := time.Now()
+	clock := func() time.Time { return now }
+	cur := Token{secret: authfi.NewSecret("old"), Expiry: now.Add(30 * time.Second)}
+	d := newDelegated(cur, ViaExchange, func(ctx context.Context) (Token, error) {
+		renewals.Add(1)
+		return Token{}, &TokenError{Code: CodeInvalidGrant}
+	}, clock)
+	for i := 0; i < 10; i++ {
+		if tok, err := d.Token(context.Background()); err != nil || tok.Reveal() != "old" {
+			t.Fatalf("the valid token is served: %v", err)
+		}
+	}
+	if renewals.Load() != 1 {
+		t.Fatalf("10 calls sent %d exchanges, want 1", renewals.Load())
+	}
+	now = now.Add(31 * time.Second) // past expiry and past the back-off
+	_, err := d.Token(context.Background())
+	var te *TokenError
+	if !errors.As(err, &te) || te.Code != CodeInvalidGrant {
+		t.Fatalf("an expired token is never served: %v", err)
+	}
+	if renewals.Load() != 2 {
+		t.Fatalf("the back-off ends: %d", renewals.Load())
+	}
+	_, err = d.Token(context.Background())
+	if err == nil || renewals.Load() != 2 {
+		t.Fatalf("and starts again: %v %d", err, renewals.Load())
+	}
+}
+
+func TestANilHTTPClientOptionIsIgnored(t *testing.T) {
+	if _, err := New("https://acme.authfi.io", "a", keyFor(t, EdDSA), WithHTTPClient(nil)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestACIBAExpiryNearMaxInt64IsClamped(t *testing.T) {
+	k := keyFor(t, EdDSA)
+	p := newPlatform(t, k)
+	if _, err := p.agent(k).RequestUserApproval(context.Background(), "jane", "msg", nil, time.Duration(1<<62)); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.backchannel[0].Get("requested_expiry"); got != fmt.Sprint(maxLifetime) {
+		t.Fatalf("requested_expiry %s", got)
+	}
+}
+
+func TestACallerGivingUpDoesNotStartTheRenewalBackoff(t *testing.T) {
+	var renewals atomic.Int32
+	now := time.Now()
+	cur := Token{secret: authfi.NewSecret("old"), Expiry: now.Add(30 * time.Second)}
+	d := newDelegated(cur, ViaExchange, func(ctx context.Context) (Token, error) {
+		renewals.Add(1)
+		<-ctx.Done()
+		return Token{}, ctx.Err()
+	}, func() time.Time { return now })
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, _ = d.Token(ctx)
+	_, _ = d.Token(ctx)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel2()
+	_, _ = d.Token(ctx2)
+	if renewals.Load() != 3 {
+		t.Fatalf("a caller's deadline is not the platform failing: renewals %d, want 3", renewals.Load())
 	}
 }

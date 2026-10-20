@@ -39,31 +39,32 @@ type platform struct {
 	tokenKey ed25519.PrivateKey
 
 	// scripts and recordings
-	forms        []url.Values // every token-endpoint form, in order
-	backchannel  []url.Values
-	mintStatus   []int    // statuses to answer the next mints with, before succeeding
-	cibaAnswers  []string // pending, slow_down, 429, denied, expired, ok
-	cibaDefault  string   // the answer once cibaAnswers runs out; default ok
-	expiresIn    int
-	approvalBody string
-	approvalCode int
-	noAgentCfg   bool
-	issuerClaim  string // overrides the issuer in the metadata
-	tokenHost    string // overrides the token endpoint
-	echoAssert   bool   // refusals echo the assertion in error_description
-	approvalAuth []string
-	slept        []time.Duration
-	noInterval   bool   // the CIBA start omits the polling interval
-	asHits       int    // fetches of the authorization server metadata
-	redirectTo   string // the token endpoint answers 307 to this URL
-	cibaRedirect bool   // the CIBA start answers 307 to itself
-	configStatus int    // the agent configuration answers this status
-	approvalNoID bool   // the approval endpoint template has no {id}
-	cibaExpires  int    // expires_in of the CIBA start; default 300
-	cibaInterval any    // interval of the CIBA start; default 5
-	hugeValid    bool   // the token endpoint answers valid JSON larger than the SDK reads
-	hugeReply    bool   // the token endpoint answers more than the SDK reads
-	approvalHit  string // body served with a 500 on the approval endpoint
+	forms                 []url.Values // every token-endpoint form, in order
+	backchannel           []url.Values
+	mintStatus            []int    // statuses to answer the next mints with, before succeeding
+	cibaAnswers           []string // pending, slow_down, 429, denied, expired, ok
+	cibaDefault           string   // the answer once cibaAnswers runs out; default ok
+	expiresIn             int
+	approvalBody          string
+	approvalCode          int
+	noAgentCfg            bool
+	issuerClaim           string // overrides the issuer in the metadata
+	tokenHost             string // overrides the token endpoint
+	echoAssert            bool   // refusals echo the assertion in error_description
+	approvalAuth          []string
+	slept                 []time.Duration
+	noInterval            bool   // the CIBA start omits the polling interval
+	asHits                int    // fetches of the authorization server metadata
+	backchannelInMetadata bool   // the authorization server metadata names the CIBA endpoint
+	redirectTo            string // the token endpoint answers 307 to this URL
+	cibaRedirect          bool   // the CIBA start answers 307 to itself
+	configStatus          int    // the agent configuration answers this status
+	approvalNoID          bool   // the approval endpoint template has no {id}
+	cibaExpires           int    // expires_in of the CIBA start; default 300
+	cibaInterval          any    // interval of the CIBA start; default 5
+	hugeValid             bool   // the token endpoint answers valid JSON larger than the SDK reads
+	hugeReply             bool   // the token endpoint answers more than the SDK reads
+	approvalHit           string // body served with a 500 on the approval endpoint
 }
 
 func newPlatform(t *testing.T, key *Key) *platform {
@@ -121,7 +122,11 @@ func (p *platform) serve(w http.ResponseWriter, r *http.Request) {
 		if p.tokenHost != "" {
 			tok = p.tokenHost
 		}
-		writeJSONTest(w, 200, map[string]any{"issuer": iss, "token_endpoint": tok})
+		meta := map[string]any{"issuer": iss, "token_endpoint": tok}
+		if p.backchannelInMetadata {
+			meta["backchannel_authentication_endpoint"] = p.issuer() + "/ciba"
+		}
+		writeJSONTest(w, 200, meta)
 	case "/.well-known/agent-configuration":
 		if p.noAgentCfg {
 			http.NotFound(w, r)

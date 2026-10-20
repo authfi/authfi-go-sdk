@@ -70,10 +70,12 @@ func (o Outcome) ModelText() string {
 	return o.Text
 }
 
-// holdText matches the gateway's hold message at the start of an error result. It is lenient about
-// what the id looks like and about case, so a change of wording around the id still reads as a hold
-// and not as a plain error that would show the id to a model.
-var holdText = regexp.MustCompile(`(?i)^\s*waiting\s+for\s+approval\s+(\S+)(?:\s+\(([a-z_]+)\))?`)
+// holdText matches the gateway's hold message at the start of an error result: the id, then the
+// "(code)" or the "A person must approve" that the gateway always writes. Either one is enough, so a
+// change of wording around the id still reads as a hold, while an unrelated error that starts with
+// the same three words ("Waiting for approval from your manager timed out") does not. Case is not
+// significant and punctuation after the id is not part of it.
+var holdText = regexp.MustCompile(`(?i)^\s*waiting\s+for\s+approval\s+([^\s()]+?)[.,;:]?\s*(?:\(([a-z_]+)\)|\.?\s*a\s+person\s+must\s+approve)`)
 
 // ReadResult reads one tools/call result. Only an error result can be a refusal or a hold, so a
 // tool whose output quotes the gateway's words is still its own answer. A refusal is read from
@@ -85,12 +87,14 @@ func ReadResult(r ToolResult) Outcome {
 	if detail, ok := r.Meta[RefusalMeta].(map[string]any); ok {
 		id := str(detail, "approval_id")
 		reason := firstNonEmpty(str(detail, "reason"), str(detail, "error"))
+		code := str(detail, "code")
 		if id != "" {
-			reason = strings.ReplaceAll(reason, id, "[approval]")
+			hide := regexp.MustCompile("(?i)" + regexp.QuoteMeta(id))
+			reason, code = hide.ReplaceAllString(reason, "[approval]"), hide.ReplaceAllString(code, "[approval]")
 		}
 		return Outcome{
 			Kind:          Refused,
-			Code:          str(detail, "code"),
+			Code:          code,
 			Reason:        reason,
 			RequiredScope: str(detail, "required_scope"),
 			ApprovalID:    id,

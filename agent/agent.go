@@ -52,6 +52,9 @@ type Agent struct {
 	discTime time.Time
 }
 
+// configRetry is how long a failed read of the agent configuration is left alone before it is tried again.
+const configRetry = time.Minute
+
 type discovered struct {
 	token       string
 	backchannel string
@@ -70,7 +73,13 @@ func (e statusError) Error() string { return fmt.Sprintf("HTTP %d", e.code) }
 type Option func(*Agent)
 
 // WithHTTPClient sets the client used for every request. Default: a client with a 30 s timeout.
-func WithHTTPClient(c *http.Client) Option { return func(a *Agent) { a.http = c } }
+func WithHTTPClient(c *http.Client) Option {
+	return func(a *Agent) {
+		if c != nil {
+			a.http = c
+		}
+	}
+}
 
 // WithResource sets what the agent's own token is for (RFC 8707): the client id of the API it
 // calls. Without it the token is for the AuthFI gateway.
@@ -161,7 +170,8 @@ func (a *Agent) endpoints(ctx context.Context) (discovered, error) {
 		return discovered{}, err
 	}
 	defer func() { <-a.discSem }()
-	if a.disc.token != "" && a.disc.configErr == nil && a.now().Sub(a.discTime) < endpointsTTL {
+	if a.disc.token != "" && a.now().Sub(a.discTime) < endpointsTTL &&
+		(a.disc.configErr == nil || a.now().Sub(a.discTime) < configRetry) {
 		return a.disc, nil
 	}
 	var as struct {

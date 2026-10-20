@@ -38,7 +38,7 @@ func (a *Agent) ApprovalStatus(ctx context.Context, id string) (Approval, error)
 	if err != nil {
 		return Approval{}, &TokenError{Code: "discovery_failed", Description: authfi.Scrub(err.Error()), Err: err}
 	}
-	if ep.configErr != nil {
+	if ep.approval == "" && ep.configErr != nil {
 		return Approval{}, &TokenError{Code: "discovery_failed", Description: authfi.Scrub(ep.configErr.Error()), Err: ep.configErr}
 	}
 	if ep.approval == "" || !strings.Contains(ep.approval, "{id}") {

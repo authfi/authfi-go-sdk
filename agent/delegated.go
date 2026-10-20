@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -70,7 +71,7 @@ func (a *Agent) RequestUserApproval(ctx context.Context, loginHint, bindingMessa
 	if err != nil {
 		return nil, &TokenError{Code: "discovery_failed", Description: authfi.Scrub(err.Error()), Err: err}
 	}
-	if ep.configErr != nil {
+	if ep.backchannel == "" && ep.configErr != nil {
 		return nil, &TokenError{Code: "discovery_failed", Description: authfi.Scrub(ep.configErr.Error()), Err: ep.configErr}
 	}
 	if ep.backchannel == "" {
@@ -81,6 +82,9 @@ func (a *Agent) RequestUserApproval(ctx context.Context, loginHint, bindingMessa
 		fields.Set("scope", strings.Join(scope, " "))
 	}
 	if expiry > 0 {
+		if expiry > maxLifetime*time.Second {
+			expiry = maxLifetime * time.Second
+		}
 		secs := int((expiry + time.Second - 1) / time.Second) // rounded up: under a second is not "none"
 		fields.Set("requested_expiry", fmt.Sprint(secs))
 	}
@@ -113,8 +117,9 @@ func (a *Agent) RequestUserApproval(ctx context.Context, loginHint, bindingMessa
 		body.ExpiresIn = maxLifetime
 	}
 	interval := defaultInterval
-	if body.Interval >= 1 && body.Interval <= 300 { // under a second would be a hot loop; over five minutes is nonsense
-		interval = time.Duration(body.Interval * float64(time.Second))
+	if body.Interval > 0 {
+		// Clamped: under a second would be a hot loop, over five minutes would outlast the request.
+		interval = time.Duration(math.Min(math.Max(body.Interval, 1), 300) * float64(time.Second))
 	}
 	return &CIBARequest{
 		authReqID:   authfi.NewSecret(body.AuthReqID),
@@ -249,7 +254,13 @@ type DelegatedToken struct {
 	subject string
 	renew   func(context.Context) (Token, error)
 	now     func() time.Time
+
+	retryAfter time.Time // a failed renewal is not tried again before this
+	lastErr    error
 }
+
+// renewBackoff is how long a failed renewal is left alone: each try sends the person's token.
+const renewBackoff = 30 * time.Second
 
 func newDelegated(t Token, via string, renew func(context.Context) (Token, error), now func() time.Time) *DelegatedToken {
 	return &DelegatedToken{sem: make(chan struct{}, 1), cur: t, via: via, renew: renew, now: now, subject: labelSubject(t.Reveal())}
@@ -281,14 +292,23 @@ func (d *DelegatedToken) Token(ctx context.Context) (Token, error) {
 		}
 		return Token{}, &TokenError{Code: CodeExpiredToken, Description: "the person's approval has run out: ask again"}
 	}
+	if d.now().Before(d.retryAfter) {
+		if d.cur.valid(d.now(), 0) {
+			return d.cur, nil
+		}
+		return Token{}, d.lastErr
+	}
 	t, err := d.renew(ctx)
 	if err != nil {
+		if ctx.Err() == nil { // the caller giving up says nothing about the platform
+			d.retryAfter, d.lastErr = d.now().Add(renewBackoff), err
+		}
 		if d.cur.valid(d.now(), 0) {
 			return d.cur, nil // the old token still works; the caller meets the refusal when it runs out
 		}
 		return Token{}, err
 	}
-	d.cur = t
+	d.cur, d.retryAfter, d.lastErr = t, time.Time{}, nil
 	return t, nil
 }
 
