@@ -211,3 +211,13 @@ func TestScrub(t *testing.T) {
 		t.Fatal("Scrub keeps the useful text")
 	}
 }
+
+func TestScrubRemovesEncodedFormsOfASecret(t *testing.T) {
+	const secret = "a b/c+d secret"
+	for _, echoed := range []string{"a+b%2Fc%2Bd+secret", "a%20b%2Fc+d%20secret", "a b/c+d secret"} {
+		out := Scrub("rejected "+echoed+" ok", secret)
+		if strings.Contains(out, "secret") || !strings.Contains(out, "rejected") {
+			t.Errorf("%q -> %q", echoed, out)
+		}
+	}
+}
