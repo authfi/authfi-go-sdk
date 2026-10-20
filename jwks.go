@@ -145,7 +145,7 @@ func (s *keySet) startLocked() *flight {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
 		defer cancel()
-		keys, err := s.fetch(ctx)
+		keys, err := s.safeFetch(ctx)
 		s.mu.Lock()
 		if err != nil {
 			s.failure = err
@@ -157,6 +157,18 @@ func (s *keySet) startLocked() *flight {
 		close(f.done)
 	}()
 	return f
+}
+
+// safeFetch turns a panic in the fetch (a custom HTTPClient transport can panic) into a failed
+// fetch: this runs on its own goroutine, where nothing else would recover it, and an unrecovered
+// panic here ends the process.
+func (s *keySet) safeFetch(ctx context.Context) (keys map[string]verifyKey, err error) {
+	defer func() {
+		if recover() != nil {
+			keys, err = nil, refuse(CodeKeySetUnavailable, "the key set fetch failed unexpectedly")
+		}
+	}()
+	return s.fetch(ctx)
 }
 
 // staleLocked returns a cached key that is past its refresh time but within the grace period.

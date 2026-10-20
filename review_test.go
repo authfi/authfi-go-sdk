@@ -552,3 +552,25 @@ func TestA3xxWithABodyIsNotASuccess(t *testing.T) {
 		t.Error("Sync")
 	}
 }
+
+type panicTransport struct{}
+
+func (panicTransport) RoundTrip(*http.Request) (*http.Response, error) { panic("transport bug") }
+
+func TestAPanickingTransportFailsTheFetchInsteadOfEndingTheProcess(t *testing.T) {
+	f := newFixture(t)
+	c := f.client(func(cfg *Config) { cfg.HTTPClient = &http.Client{Transport: panicTransport{}} })
+	_, err := c.VerifyToken(f.mint(tokenSpec{}))
+	mustCode(t, err, CodeKeySetUnavailable)
+	if err := c.Start(); err == nil {
+		t.Fatal("Start must report the failed fetch")
+	}
+}
+
+func TestStartReportsAFailedFetch(t *testing.T) {
+	f := newFixture(t)
+	f.status.Store(500)
+	if err := f.client().Start(); err == nil {
+		t.Fatal("Start must return the fetch failure")
+	}
+}
