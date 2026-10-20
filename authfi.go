@@ -32,8 +32,9 @@ import (
 	"time"
 )
 
-// Config configures a Client. It holds secrets (ClientSecret, APIKey), so it prints redacted under
-// every fmt verb, in JSON and in slog.
+// Config configures a Client. It holds secrets (ClientSecret, APIKey), so it prints redacted when
+// printed as a Config, in JSON and in slog. New moves the secrets into the Client as Secret values
+// and keeps no copy of them in a string, so printing a Client by any route shows none.
 type Config struct {
 	// Issuer is the project issuer, for example https://acme.authfi.io. Required to verify tokens.
 	Issuer string
@@ -63,12 +64,15 @@ type Config struct {
 
 // Client verifies tokens and guards handlers. It prints redacted.
 type Client struct {
-	cfg         Config
-	cfgErr      error
-	permissions map[string]*string // name → description
-	mu          sync.Mutex
-	keys        *keySet
-	clock       func() time.Time // tests only
+	cfg          Config // ClientSecret and APIKey are blank here; see clientSecret and apiKey
+	clientSecret Secret
+	apiKey       Secret
+	api          *http.Client // management and cloud calls: a redirect is an error, not a hop
+	cfgErr       error
+	permissions  map[string]*string // name → description
+	mu           sync.Mutex
+	keys         *keySet
+	clock        func() time.Time // tests only
 }
 
 type Claims struct {
@@ -109,8 +113,16 @@ func New(cfg Config) *Client {
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: jwksFetchTimeout}
 	}
-	c := &Client{cfg: cfg, permissions: make(map[string]*string)}
-	c.cfgErr = checkConfig(cfg)
+	c := &Client{
+		cfg: cfg, clientSecret: NewSecret(cfg.ClientSecret), apiKey: NewSecret(cfg.APIKey),
+		permissions: make(map[string]*string),
+		api: &http.Client{
+			Timeout:       30 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+	}
+	c.cfg.ClientSecret, c.cfg.APIKey = "", ""
+	c.cfgErr = checkConfig(c.cfg)
 	c.keys = &keySet{
 		url:    trimIssuer(cfg.Issuer) + jwksPath,
 		ttl:    cfg.JWKSRefresh,
@@ -257,16 +269,16 @@ func (c *Client) Sync() error {
 	data, _ := json.Marshal(body)
 	url := fmt.Sprintf("%s/%s/v1/permissions/sync", c.cfg.APIURL, c.cfg.Tenant)
 	req, _ := http.NewRequest("PUT", url, bytes.NewReader(data))
-	req.Header.Set("X-API-Key", c.cfg.APIKey)
+	req.Header.Set("X-API-Key", c.apiKey.Reveal())
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := c.api.Do(req)
 	if err != nil {
 		return fmt.Errorf("authfi: sync failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode/100 != 2 {
 		return fmt.Errorf("authfi: sync failed (%d): %s", resp.StatusCode, c.serverText(resp.Body))
 	}
 
@@ -282,7 +294,7 @@ func (c *Client) Sync() error {
 // Requires ApplicationID and ClientSecret in Config — cloud credentials are scoped
 // per application so each app can only access the cloud resources its IAM role permits.
 func (c *Client) CloudCredentials(userToken, provider string, opts map[string]string) (map[string]interface{}, error) {
-	if c.cfg.ApplicationID == "" || c.cfg.ClientSecret == "" {
+	if c.cfg.ApplicationID == "" || c.clientSecret.IsEmpty() {
 		return nil, fmt.Errorf("authfi: ApplicationID and ClientSecret required for cloud credentials")
 	}
 
@@ -300,16 +312,16 @@ func (c *Client) CloudCredentials(userToken, provider string, opts map[string]st
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+userToken)
 	req.Header.Set("X-Client-ID", c.cfg.ApplicationID)
-	req.Header.Set("X-Client-Secret", c.cfg.ClientSecret)
+	req.Header.Set("X-Client-Secret", c.clientSecret.Reveal())
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := c.api.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("cloud credentials request failed: %s", Scrub(err.Error(), c.cfg.ClientSecret, userToken))
+		return nil, fmt.Errorf("cloud credentials request failed: %s", Scrub(err.Error(), c.clientSecret.Reveal(), userToken))
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("cloud credentials failed (%d): %s", resp.StatusCode, c.serverText(resp.Body))
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("cloud credentials failed (%d): %s", resp.StatusCode, c.serverText(resp.Body, userToken))
 	}
 
 	var result map[string]interface{}
@@ -322,7 +334,7 @@ func (c *Client) CloudCredentials(userToken, provider string, opts map[string]st
 // CloudToken gets a raw OIDC token for manual federation.
 // Requires ApplicationID and ClientSecret in Config.
 func (c *Client) CloudToken(userToken, audience string, ttl int) (string, error) {
-	if c.cfg.ApplicationID == "" || c.cfg.ClientSecret == "" {
+	if c.cfg.ApplicationID == "" || c.clientSecret.IsEmpty() {
 		return "", fmt.Errorf("authfi: ApplicationID and ClientSecret required for cloud token")
 	}
 
@@ -332,16 +344,16 @@ func (c *Client) CloudToken(userToken, audience string, ttl int) (string, error)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+userToken)
 	req.Header.Set("X-Client-ID", c.cfg.ApplicationID)
-	req.Header.Set("X-Client-Secret", c.cfg.ClientSecret)
+	req.Header.Set("X-Client-Secret", c.clientSecret.Reveal())
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := c.api.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("cloud token request failed: %s", Scrub(err.Error(), c.cfg.ClientSecret, userToken))
+		return "", fmt.Errorf("cloud token request failed: %s", Scrub(err.Error(), c.clientSecret.Reveal(), userToken))
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("cloud token failed (%d): %s", resp.StatusCode, c.serverText(resp.Body))
+	if resp.StatusCode/100 != 2 {
+		return "", fmt.Errorf("cloud token failed (%d): %s", resp.StatusCode, c.serverText(resp.Body, userToken))
 	}
 	var result struct {
 		Token string `json:"token"`
@@ -354,9 +366,9 @@ func (c *Client) CloudToken(userToken, audience string, ttl int) (string, error)
 
 // serverText reads a bounded part of a server reply for an error, with every secret this client
 // holds scrubbed out of it.
-func (c *Client) serverText(body io.Reader) string {
+func (c *Client) serverText(body io.Reader, extra ...string) string {
 	b, _ := io.ReadAll(io.LimitReader(body, maxEchoed*4))
-	return Scrub(string(b), c.cfg.ClientSecret, c.cfg.APIKey)
+	return Scrub(string(b), append([]string{c.clientSecret.Reveal(), c.apiKey.Reveal()}, extra...)...)
 }
 
 // String, GoString and Format print the issuer and the client id and nothing secret.

@@ -58,7 +58,9 @@ A refusal is an `*authfi.Error`; read `Code` with `errors.As`. Nothing from the 
 
 ## Secrets
 
-`Config` and `Client` print the issuer and the client id and nothing else, under every `fmt` verb, in JSON and in `slog`. Errors that carry a server's reply have every secret and every JWT-shaped string removed (`authfi.Scrub`). Wrap a value you hold in `authfi.NewSecret` to get the same behaviour.
+A `Config` prints the issuer and the client id and nothing else (under every `fmt` verb, in JSON and in `slog`), and `New` moves `ClientSecret` and `APIKey` into the `Client` as `authfi.Secret` values, so printing a `Client` by any route shows none of them. `fmt` cannot call a `String` method on an unexported field of your own struct, so a `Config` that you embed that way prints its plain fields: keep secrets in the environment or in an `authfi.Secret` (`authfi.NewSecret`, read with `Reveal`).
+
+Errors that carry a server's reply have every secret and every JWT-shaped string removed (`authfi.Scrub`) and are bounded in length. Calls to the management and cloud routes do not follow redirects, so a credential cannot be sent on to another host.
 
 ## Features
 

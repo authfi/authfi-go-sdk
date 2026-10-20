@@ -54,10 +54,11 @@ type keySet struct {
 	client *http.Client
 	now    func() time.Time
 
-	mu          sync.RWMutex
-	keys        map[string]verifyKey
-	fetched     time.Time
-	lastAttempt time.Time
+	mu        sync.RWMutex
+	keys      map[string]verifyKey
+	fetched   time.Time
+	attempted time.Time
+	failure   error // why the last attempt failed; nil when it succeeded
 
 	fetchMu sync.Mutex
 }
@@ -71,21 +72,19 @@ func (s *keySet) get(ctx context.Context, kid string) (verifyKey, error) {
 	if k, ok := s.fresh(kid); ok { // another request refreshed while this one waited
 		return k, nil
 	}
-	s.mu.RLock()
-	known := s.keys != nil
-	_, have := s.keys[kid]
-	recent := s.now().Sub(s.lastAttempt) < minRefetch
-	s.mu.RUnlock()
-	// A kid that is not in the cached set is refetched at most once per minRefetch.
-	if known && !have && recent {
+	// One attempt per minRefetch, whatever came of the last one. This bounds what forged kids, an
+	// expired cache and a down issuer can cost the issuer: not one fetch per request.
+	if s.now().Sub(s.lastAttempt()) < minRefetch {
+		if k, ok := s.stale(kid); ok {
+			return k, nil
+		}
+		if err := s.lastFailure(); err != nil {
+			return verifyKey{}, err
+		}
 		return verifyKey{}, refuse(CodeUnknownKey, "the issuer's key set has no such key")
 	}
 	if err := s.refresh(ctx); err != nil {
-		s.mu.RLock()
-		k, ok := s.keys[kid]
-		withinGrace := s.now().Sub(s.fetched) < s.ttl+staleGrace
-		s.mu.RUnlock()
-		if ok && withinGrace {
+		if k, ok := s.stale(kid); ok {
 			return k, nil
 		}
 		return verifyKey{}, err
@@ -97,6 +96,29 @@ func (s *keySet) get(ctx context.Context, kid string) (verifyKey, error) {
 		return verifyKey{}, refuse(CodeUnknownKey, "the issuer's key set has no such key")
 	}
 	return k, nil
+}
+
+func (s *keySet) lastAttempt() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.attempted
+}
+
+func (s *keySet) lastFailure() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.failure
+}
+
+// stale returns a cached key that is past its refresh time but within the grace period.
+func (s *keySet) stale(kid string) (verifyKey, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	k, ok := s.keys[kid]
+	if !ok || s.now().Sub(s.fetched) >= s.ttl+staleGrace {
+		return verifyKey{}, false
+	}
+	return k, true
 }
 
 func (s *keySet) fresh(kid string) (verifyKey, bool) {
@@ -111,36 +133,56 @@ func (s *keySet) fresh(kid string) (verifyKey, bool) {
 
 func (s *keySet) refresh(ctx context.Context) error {
 	s.mu.Lock()
-	s.lastAttempt = s.now()
+	previous := s.attempted
+	s.attempted = s.now()
 	s.mu.Unlock()
 
+	keys, err := s.fetch(ctx)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err != nil {
+		if ctx.Err() != nil {
+			// The caller gave up; that says nothing about the issuer, so it is not an attempt.
+			s.attempted = previous
+			return &Error{Code: CodeKeySetUnavailable, Message: "the request ended before the key set arrived", Err: ctx.Err()}
+		}
+		s.failure = err
+		return err
+	}
+	s.keys, s.fetched, s.failure = keys, s.now(), nil
+	return nil
+}
+
+func (s *keySet) fetch(ctx context.Context) (map[string]verifyKey, error) {
 	ctx, cancel := context.WithTimeout(ctx, jwksFetchTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.url, nil)
 	if err != nil {
-		return &Error{Code: CodeKeySetUnavailable, Message: "the key set URL is invalid", Err: err}
+		return nil, &Error{Code: CodeKeySetUnavailable, Message: "the key set URL is invalid", Err: err}
 	}
 	req.Header.Set("Accept", "application/json")
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return &Error{Code: CodeKeySetUnavailable, Message: "the issuer's key set could not be fetched", Err: err}
+		return nil, &Error{Code: CodeKeySetUnavailable, Message: "the key set of the issuer could not be fetched", Err: err}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return refuse(CodeKeySetUnavailable, "the issuer's key set answered HTTP %d", resp.StatusCode)
+		return nil, refuse(CodeKeySetUnavailable, "the key set of the issuer answered HTTP %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, jwksMaxBytes+1))
 	if err != nil || len(body) > jwksMaxBytes {
-		return refuse(CodeKeySetUnavailable, "the issuer's key set could not be read")
+		return nil, refuse(CodeKeySetUnavailable, "the key set of the issuer could not be read")
 	}
 	keys, err := parseKeySet(body)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	s.mu.Lock()
-	s.keys, s.fetched = keys, s.now()
-	s.mu.Unlock()
-	return nil
+	if len(keys) == 0 {
+		// An empty set would wipe the keys that still verify; treat it as the failure it is.
+		return nil, refuse(CodeKeySetUnavailable, "the key set of the issuer holds no usable key")
+	}
+	return keys, nil
 }
 
 type jwk struct {

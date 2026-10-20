@@ -13,6 +13,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -32,6 +33,8 @@ type fixture struct {
 	nowMu  sync.Mutex
 	fetch  atomic.Int32
 	status atomic.Int32 // when non-zero, the key set answers this status
+	empty  atomic.Bool  // when set, the key set holds no keys
+	big    atomic.Bool  // when set, the key set is larger than the SDK reads
 
 	mu   sync.Mutex
 	keys map[string]*signer // by kid; all are published
@@ -42,6 +45,7 @@ type signer struct {
 	rsa      *rsa.PrivateKey
 	ec       *ecdsa.PrivateKey
 	ed       ed25519.PrivateKey
+	salt     int // PS256 salt length; 0 means the standard one (equal to the hash)
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -104,7 +108,12 @@ func (f *fixture) serve(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	keys := []map[string]string{}
 	for _, s := range f.keys {
-		keys = append(keys, s.jwk())
+		if !f.empty.Load() {
+			keys = append(keys, s.jwk())
+		}
+	}
+	if f.big.Load() {
+		keys = append(keys, map[string]string{"kty": "oct", "kid": "pad", "k": strings.Repeat("A", 2<<20)})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if st != 0 {
@@ -133,7 +142,11 @@ func (s *signer) sign(data string) []byte {
 	h := sha256.Sum256([]byte(data))
 	switch {
 	case s.rsa != nil && s.alg == "PS256":
-		sig, _ := rsa.SignPSS(rand.Reader, s.rsa, crypto.SHA256, h[:], &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash})
+		salt := rsa.PSSSaltLengthEqualsHash
+		if s.salt != 0 {
+			salt = s.salt
+		}
+		sig, _ := rsa.SignPSS(rand.Reader, s.rsa, crypto.SHA256, h[:], &rsa.PSSOptions{SaltLength: salt})
 		return sig
 	case s.rsa != nil:
 		sig, _ := rsa.SignPKCS1v15(rand.Reader, s.rsa, crypto.SHA256, h[:])

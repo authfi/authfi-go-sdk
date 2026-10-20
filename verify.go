@@ -130,7 +130,7 @@ func (c *Client) verify(ctx context.Context, token string) (*Claims, error) {
 	if header.Kid == "" {
 		return nil, refuse(CodeKeyIDRequired, "the token names no signing key")
 	}
-	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+	sig, err := decodeB64(parts[2])
 	if err != nil || len(sig) == 0 {
 		return nil, refuse(CodeMalformed, "the token signature is not valid")
 	}
@@ -179,8 +179,17 @@ func verifySignature(alg string, pub any, signed, sig []byte) bool {
 	return false
 }
 
+// decodeB64 decodes base64url without padding, strictly: the Go decoder skips CR and LF, which would
+// let two different strings stand for one signature, and Strict refuses non-zero trailing bits.
+func decodeB64(seg string) ([]byte, error) {
+	if strings.ContainsAny(seg, "\r\n") {
+		return nil, errors.New("not base64url")
+	}
+	return base64.RawURLEncoding.Strict().DecodeString(seg)
+}
+
 func decodeSegment(seg string, into any) error {
-	raw, err := base64.RawURLEncoding.DecodeString(seg)
+	raw, err := decodeB64(seg)
 	if err != nil {
 		return err
 	}
@@ -294,7 +303,23 @@ func (a *audience) UnmarshalJSON(b []byte) error {
 }
 
 // numericDate is a JSON number of seconds; a fractional value is allowed (RFC 7519 section 2).
+// Values outside the years 1970 to 9999 are refused: beyond them int64 conversion wraps, and a
+// far-future nbf or iat would read as the past.
 type numericDate float64
+
+const maxNumericDate = 253402300799 // 9999-12-31T23:59:59Z
+
+func (d *numericDate) UnmarshalJSON(b []byte) error {
+	var f float64
+	if err := json.Unmarshal(b, &f); err != nil {
+		return err
+	}
+	if f < 0 || f > maxNumericDate || f != f {
+		return errors.New("time out of range")
+	}
+	*d = numericDate(f)
+	return nil
+}
 
 func (d numericDate) time() time.Time {
 	sec := float64(d)

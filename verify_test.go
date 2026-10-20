@@ -299,6 +299,7 @@ func TestUnknownKeyIDsDoNotAmplify(t *testing.T) {
 	}
 	before := f.fetch.Load()
 	for i := 0; i < 50; i++ {
+		f.advance(200 * time.Millisecond) // 10 s in all: still inside the 15 s interval
 		_, err := c.VerifyToken(f.mint(tokenSpec{header: map[string]any{"kid": fmt.Sprintf("forged-%d", i)}}))
 		mustCode(t, err, CodeUnknownKey)
 	}
