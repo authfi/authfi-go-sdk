@@ -48,6 +48,10 @@ type Config struct {
 	// Leeway is the clock skew allowed on exp, nbf and iat. Zero means 60 s, negative means none,
 	// and the most is 300 s.
 	Leeway time.Duration
+	// Revocations, when set, makes Verify refuse a token whose subject (or, on a delegated token,
+	// actor) was revoked after the token was issued. Feed it with a Receiver (NewReceiver) or
+	// with Revoke. Without it no revocation is checked.
+	Revocations *RevocationStore
 	// HTTPClient fetches the key set of the issuer. Default: a client with a 10 s timeout.
 	HTTPClient *http.Client
 	// Logger receives refusal codes (never a token). Default: no logging.

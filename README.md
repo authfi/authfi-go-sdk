@@ -53,6 +53,7 @@ func usersHandler(w http.ResponseWriter, r *http.Request) {
 - `exp` is present and in the future, with 60 seconds of leeway (`Config.Leeway`), and `nbf` and `iat` hold;
 - `sub` and `tenant_id` are present, and `tenant_id` equals `TenantID` when you set it;
 - it is not bound to a key (`cnf`, `authfi_mandate`) and carries no delegation chain.
+- with `Config.Revocations` set, neither its subject nor its actor was revoked after it was issued (see Revocation).
 
 A refusal is an `*authfi.Error`; read `Code` with `errors.As`. Nothing from the token is in the message.
 
@@ -68,6 +69,7 @@ Errors that carry a server's reply have every secret and every JWT-shaped string
 - `Require("read:users")` middleware: permission checks
 - `RequireRole("admin")` middleware: role-based access
 - `Authenticate` middleware: token only, no permission check
+- `Receiver`: Shared Signals push receiver and `RevocationStore`, so a revoked agent is refused at once (see Revocation)
 - Cloud credentials (GCP/AWS/Azure/OCI)
 - Verification uses the standard library only; the `agent` package adds `golang.org/x/oauth2` and the OpenTelemetry trace API
 
@@ -97,6 +99,43 @@ client := &http.Client{Transport: rt}
 The key, every token, every assertion and the CIBA handle print redacted and never appear in an error. `agent.ReadResult` reads the gateway's answer to a tool call as a result, a refusal or a hold, and `agent.WithApproval` sends a held call again once a person has decided.
 
 A refusal is a `*agent.TokenError` with the OAuth `Code` (`invalid_client`, `access_denied`, `expired_token`, ...) and is not retried. A network failure while minting is retried twice with a fresh assertion; a request that creates state (CIBA, exchange) is never sent twice. `LoadKey` checks file modes on Linux and macOS only.
+
+## Revocation: stop an agent's tokens the moment AuthFI withdraws it
+
+Access tokens verify offline, so a revoked or suspended agent keeps working until its token expires, unless AuthFI tells you. AuthFI sends a signed Shared Signals event (RFC 8935 push) when an agent is revoked, suspended or deleted. A `Receiver` takes it and your `Client` refuses the agent's earlier tokens at once.
+
+```go
+store := authfi.NewRevocationStore(authfi.RevocationOptions{
+    TokenLifetime: 24 * time.Hour, // at least the longest token you accept
+})
+auth := authfi.New(authfi.Config{
+    Issuer:      "https://acme.authfi.io",
+    Audience:    []string{"my-api-client-id"},
+    Revocations: store, // Verify and the middleware now check revocations
+})
+recv, err := auth.NewReceiver(authfi.ReceiverConfig{
+    Audience:  "my-stream",                        // the audience you registered the stream with
+    AuthToken: authfi.NewSecret(pushBearer),       // optional: the bearer AuthFI sends on each push
+    OnSignal:  func(s authfi.Signal) { log.Printf("%s %s", s.Event, s.Subject) },
+})
+http.Handle("/ssf/push", recv) // the https URL you register as the stream endpoint
+```
+
+What the receiver does, in order, and what it refuses:
+
+- POST with `Content-Type: application/secevent+jwt`, at most 16 KiB; any other method is 405. If you set `AuthToken`, the push must carry that bearer (401 otherwise).
+- The SET is a JWS signed by a key in the project's key set (the one that verifies agent tokens), with `typ` `secevent+jwt`. `none`, HMAC and unknown keys are refused; a key set that cannot be read answers 503 so AuthFI retries.
+- `iss` is the configured issuer, `aud` includes your stream audience, `jti` and `iat` are present, `iat` is not in the future and not older than `TokenLifetime`, `exp` (if present) has not passed, `sub_id` names the subject, `events` holds objects.
+- Accepted: `202`. Refused: `400` with `{"err": ..., "description": ...}` where `err` is `invalid_request`, `invalid_key`, `invalid_issuer`, `invalid_audience` or `authentication_failed`. Nothing is recorded for a refused SET.
+- A `jti` seen before is answered `202` and applied once, so AuthFI can retry a push whose answer was lost. The set of seen ids is bounded.
+
+`session-revoked`, `account-purged` and `credential-compromise` revoke the subject: tokens issued at or before the SET's `iat` are refused with code `token_revoked`, and a token issued after it is accepted. A delegated token is refused when its actor (`act.sub`) is revoked. A token with no `iat` is refused while its subject has a live revocation. `token-claims-change` with `resumed: true` reaches `OnSignal` with `Resumed` set and changes nothing else: a resumed agent mints a new token, which is newer than the revocation.
+
+`store.Revoke(subject, notBefore)` and `store.IsRevoked(subject, issuedAt)` are there for your own use. The store holds at most `MaxEntries` subjects (default 100,000) and forgets a revocation once it is older than `TokenLifetime`. When it is full it drops the oldest revocations and refuses every token issued before the newest one it dropped, whatever its subject, until that time passes `TokenLifetime`: a full store costs some holders a new token and never lets a revoked one through.
+
+To register the stream from code, `auth.RegisterStream(ctx, bearer, authfi.StreamRequest{Audience: "my-stream", EndpointURL: "https://api.example.com/ssf/push", AuthToken: pushBearer})` reads the issuer's `/.well-known/ssf-configuration` and posts the registration to the `configuration_endpoint` it names, which must be on the issuer's host. The bearer is a credential allowed to register streams.
+
+The store lives in memory: run one per process, and feed every replica (register one stream per replica or share the events yourself).
 
 ## Cloud Credentials
 

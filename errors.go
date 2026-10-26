@@ -27,6 +27,7 @@ const (
 	CodeActChainNotAllowed = "token_act_chain_unsupported"
 	CodeKeySetUnavailable  = "jwks_unavailable"
 	CodeMissingBearer      = "missing_authorization"
+	CodeRevoked            = "token_revoked"
 )
 
 // Error is a refusal or failure with a stable Code. Use errors.As to read it. Its text never

@@ -100,6 +100,30 @@ func (c *Client) verify(ctx context.Context, token string) (*Claims, error) {
 	if c.cfgErr != nil {
 		return nil, c.cfgErr
 	}
+	payload, err := c.verifyCompact(ctx, token, accessTokenTyp)
+	if err != nil {
+		return nil, err
+	}
+	var w wireClaims
+	if err := json.Unmarshal(payload, &w); err != nil {
+		return nil, refuse(CodeMalformed, "the token payload is not valid")
+	}
+	claims, err := c.checkClaims(&w)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.checkRevoked(claims); err != nil {
+		return nil, err
+	}
+	return claims, nil
+}
+
+// verifyCompact checks the structure and the signature of a compact JWS: size, three parts, an
+// allowed alg, no critical extensions, the media type wantTyp, a kid, and a signature by the
+// issuer's key of that kid that is allowed to use that alg. It returns the decoded payload and
+// reads nothing from it. Access tokens and Security Event Tokens both pass through it, so the two
+// cannot drift apart on what a valid signature is.
+func (c *Client) verifyCompact(ctx context.Context, token, wantTyp string) ([]byte, error) {
 	if len(token) > maxTokenBytes {
 		return nil, refuse(CodeTooLarge, "the token is larger than %d bytes", maxTokenBytes)
 	}
@@ -124,8 +148,8 @@ func (c *Client) verify(ctx context.Context, token string) (*Claims, error) {
 	if present(header.Crit) {
 		return nil, refuse(CodeCritNotSupported, "the token carries critical header extensions this SDK does not understand")
 	}
-	if typ := strings.TrimPrefix(strings.ToLower(header.Typ), "application/"); typ != accessTokenTyp {
-		return nil, refuse(CodeTypInvalid, "the token is not an access token (typ must be %s)", accessTokenTyp)
+	if typ := strings.TrimPrefix(strings.ToLower(header.Typ), "application/"); typ != wantTyp {
+		return nil, refuse(CodeTypInvalid, "the token is not of the expected type (typ must be %s)", wantTyp)
 	}
 	if header.Kid == "" {
 		return nil, refuse(CodeKeyIDRequired, "the token names no signing key")
@@ -145,12 +169,11 @@ func (c *Client) verify(ctx context.Context, token string) (*Claims, error) {
 	if !verifySignature(header.Alg, key.pub, []byte(parts[0]+"."+parts[1]), sig) {
 		return nil, refuse(CodeSignatureInvalid, "the token signature does not verify")
 	}
-
-	var w wireClaims
-	if err := decodeSegment(parts[1], &w); err != nil {
+	payload, err := decodeB64(parts[1])
+	if err != nil {
 		return nil, refuse(CodeMalformed, "the token payload is not valid")
 	}
-	return c.checkClaims(&w)
+	return payload, nil
 }
 
 func verifySignature(alg string, pub any, signed, sig []byte) bool {
