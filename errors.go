@@ -47,6 +47,7 @@ const (
 	CodeDPoPKeyMismatch       = "dpop_key_mismatch"
 	CodeDPoPNonce             = "dpop_nonce"
 	CodeDPoPReplayUnavailable = "dpop_replay_unavailable"
+	CodeDPoPReplayGuardFull   = "dpop_replay_guard_full"
 	CodeChainNotProven        = "chain_not_proven"
 	CodeChainPolicy           = "chain_policy"
 	CodeChainPin              = "chain_pin"

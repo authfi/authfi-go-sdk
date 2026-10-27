@@ -51,7 +51,8 @@ type Config struct {
 	// actor) was revoked after the token was issued. Feed it with a Receiver (NewReceiver) or
 	// with Revoke. Without it no revocation is checked.
 	Revocations *RevocationStore
-	// HTTPClient fetches the key set of the issuer. Default: a client with a 10 s timeout.
+	// HTTPClient fetches the key set of the issuer. Default: a client with a 10 s timeout that does
+	// not follow a redirect to another host or scheme.
 	HTTPClient *http.Client
 	// Logger receives refusal codes (never a token). Default: no logging.
 	Logger *slog.Logger
@@ -140,7 +141,7 @@ func New(cfg Config) *Client {
 		cfg.JWKSRefresh = 5 * time.Minute
 	}
 	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = &http.Client{Timeout: jwksFetchTimeout}
+		cfg.HTTPClient = &http.Client{Timeout: jwksFetchTimeout, CheckRedirect: sameHostRedirect}
 	}
 	c := &Client{
 		cfg: cfg, clientSecret: NewSecret(cfg.ClientSecret), apiKey: NewSecret(cfg.APIKey),
@@ -455,6 +456,9 @@ func writeAuthError(w http.ResponseWriter, err error) {
 		if code == CodeKeySetUnavailable || code == CodeNotConfigured {
 			status = http.StatusServiceUnavailable
 		}
+	}
+	if code == CodeDPoPReplayGuardFull {
+		status = http.StatusTooManyRequests
 	}
 	if code == CodeDPoPReplayUnavailable {
 		status = http.StatusServiceUnavailable

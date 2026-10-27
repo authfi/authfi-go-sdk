@@ -60,10 +60,24 @@ func checkAgentConfig(cfg Config) error {
 	return nil
 }
 
-// isAgentToken reports whether the token is an agent's: an agent id as subject or client, or an
-// act claim.
+// isAgentToken reports whether the token is an agent's: an agent id (agt_, any case, spaces
+// around ignored) as subject, client, authorized party or agent_id, or an act claim.
 func isAgentToken(w *wireClaims) bool {
-	return strings.HasPrefix(w.Subject, agentIDPrefix) || strings.HasPrefix(w.ClientID, agentIDPrefix) || present(w.Act)
+	for _, id := range []string{w.Subject, w.ClientID, w.Azp, w.AgentID} {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(id)), agentIDPrefix) {
+			return true
+		}
+	}
+	return present(w.Act)
+}
+
+// newProofRequest takes from r what a proof is checked against.
+func newProofRequest(r *http.Request) proofRequest {
+	return proofRequest{
+		method: r.Method, host: r.Host, requestURI: r.RequestURI, path: r.URL.EscapedPath(), tls: r.TLS != nil,
+		proofs: r.Header.Values(headerDPoP), forwardedHost: r.Header.Values("X-Forwarded-Host"),
+		forwardedProto: r.Header.Values("X-Forwarded-Proto"),
+	}
 }
 
 // cnfJKT is cnf.jkt, or "" when the token carries none.
@@ -125,7 +139,7 @@ func (c *Client) proveBinding(ctx context.Context, w *wireClaims, p presented, a
 	if jkt == "" {
 		return refuse(CodeDPoPProofRequired, "an agent token must be bound to a key (cnf.jkt)")
 	}
-	proof, perr := verifyProof(p.req, p.token, proofEnv{now: c.now(), nonces: c.nonces,
+	proof, perr := verifyProof(newProofRequest(p.req), p.token, proofEnv{now: c.now(), nonces: c.nonces,
 		publicURL: c.cfg.PublicURL, trustForwarded: c.cfg.TrustForwarded})
 	if perr != nil {
 		return perr
@@ -141,6 +155,8 @@ func (c *Client) proveBinding(ctx context.Context, w *wireClaims, p presented, a
 	// The proof id is spent last: a request that failed any other check does not use it up.
 	fresh, err := c.replay.Claim(ctx, proof.id, proof.until)
 	switch {
+	case errors.Is(err, ErrReplayGuardFull):
+		return refuse(CodeDPoPReplayGuardFull, "the replay guard holds too many DPoP proofs")
 	case err != nil:
 		return refuse(CodeDPoPReplayUnavailable, "the replay guard could not record the DPoP proof")
 	case !fresh:

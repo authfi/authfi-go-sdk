@@ -344,3 +344,13 @@ func boundedX5c(x5c []string) []string {
 	}
 	return x5c
 }
+
+// sameHostRedirect lets a redirect stay on the issuer's host and scheme and refuses any other, so a
+// key set cannot be read from somewhere the issuer did not name. The redirect answer is then the
+// response, which is not a key set.
+func sameHostRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 3 || req.URL.Host != via[0].URL.Host || req.URL.Scheme != via[0].URL.Scheme {
+		return http.ErrUseLastResponse
+	}
+	return nil
+}

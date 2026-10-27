@@ -313,6 +313,8 @@ type wireClaims struct {
 	Act      json.RawMessage `json:"act"`
 	Cnf      json.RawMessage `json:"cnf"`
 	Mandate  json.RawMessage `json:"authfi_mandate"`
+	Azp      string          `json:"azp"`
+	AgentID  string          `json:"agent_id"`
 }
 
 type audience []string

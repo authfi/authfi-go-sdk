@@ -17,7 +17,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -49,43 +48,93 @@ type ReplayGuard interface {
 	Claim(ctx context.Context, id string, until time.Time) (fresh bool, err error)
 }
 
-// maxReplayEntries bounds the default guard. A proof is recorded only after every other check
-// passed, so only a holder of a bound key can fill it.
-const maxReplayEntries = 1 << 17
+const (
+	// maxReplayEntries bounds the default guard as a whole and maxReplayPerKey what one proof key may
+	// hold in it, so one bound key cannot fill the guard and lock the others out.
+	maxReplayEntries = 1 << 17
+	maxReplayPerKey  = 1000
+	// replayBucket is the granularity, in seconds, entries expire at, so expiry never scans the
+	// whole guard.
+	replayBucket = 10
+)
 
-var errReplayFull = errors.New("replay guard is full")
+// ErrReplayGuardFull is what a ReplayGuard returns from Claim when it refuses to record an id
+// because it holds too many (for that key, or in all). The request is refused with
+// dpop_replay_guard_full.
+var ErrReplayGuardFull = errors.New("replay guard is full")
 
-// memoryReplayGuard is the default ReplayGuard: bounded, and fail closed when full.
+// memoryReplayGuard is the default ReplayGuard: bounded in total and per proof key, expired in
+// time buckets, and fail closed when full.
 type memoryReplayGuard struct {
-	mu   sync.Mutex
-	seen map[[32]byte]time.Time
-	now  func() time.Time
+	mu      sync.Mutex
+	now     func() time.Time
+	seen    map[[32]byte]struct{}
+	perKey  map[string]int
+	buckets map[int64][]replayEntry // by the bucket the entry expires in
+	swept   int64                   // buckets before this one are gone
+}
+
+type replayEntry struct {
+	hash [32]byte
+	key  string
 }
 
 func newMemoryReplayGuard(now func() time.Time) *memoryReplayGuard {
-	return &memoryReplayGuard{seen: map[[32]byte]time.Time{}, now: now}
+	return &memoryReplayGuard{now: now, seen: map[[32]byte]struct{}{}, perKey: map[string]int{}, buckets: map[int64][]replayEntry{}}
+}
+
+// replayKey is the proof key an id belongs to: ids are thumbprint:jti and a thumbprint has no colon.
+func replayKey(id string) string {
+	k, _, _ := strings.Cut(id, ":")
+	return k
 }
 
 func (g *memoryReplayGuard) Claim(_ context.Context, id string, until time.Time) (bool, error) {
-	key := sha256.Sum256([]byte(id))
+	hash := sha256.Sum256([]byte(id))
+	key := replayKey(id)
 	now := g.now()
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if exp, ok := g.seen[key]; ok && now.Before(exp) {
+	g.sweep(now)
+	if _, dup := g.seen[hash]; dup {
 		return false, nil
 	}
-	if len(g.seen) >= maxReplayEntries {
-		for k, exp := range g.seen {
-			if !now.Before(exp) {
-				delete(g.seen, k)
+	if g.perKey[key] >= maxReplayPerKey || len(g.seen) >= maxReplayEntries {
+		return false, ErrReplayGuardFull
+	}
+	b := until.Unix() / replayBucket
+	g.seen[hash] = struct{}{}
+	g.perKey[key]++
+	g.buckets[b] = append(g.buckets[b], replayEntry{hash, key})
+	return true, nil
+}
+
+// sweep drops the buckets that ended before now. Each bucket is visited once, so the work follows
+// what expired and not what the guard holds.
+func (g *memoryReplayGuard) sweep(now time.Time) {
+	cur := now.Unix() / replayBucket
+	if g.swept == 0 || cur-g.swept > int64(len(g.buckets)) {
+		for b := range g.buckets {
+			if b < cur {
+				g.drop(b)
 			}
 		}
-		if len(g.seen) >= maxReplayEntries {
-			return false, errReplayFull
+	} else {
+		for b := g.swept; b < cur; b++ {
+			g.drop(b)
 		}
 	}
-	g.seen[key] = until
-	return true, nil
+	g.swept = cur
+}
+
+func (g *memoryReplayGuard) drop(b int64) {
+	for _, e := range g.buckets[b] {
+		delete(g.seen, e.hash)
+		if g.perKey[e.key]--; g.perKey[e.key] <= 0 {
+			delete(g.perKey, e.key)
+		}
+	}
+	delete(g.buckets, b)
 }
 
 // hmacNonces issues stateless server nonces: a time window and an HMAC over it. A nonce is valid in
@@ -132,6 +181,14 @@ type proofEnv struct {
 	trustForwarded bool
 }
 
+// proofRequest is the part of an HTTP request a proof is checked against.
+type proofRequest struct {
+	method, host, requestURI, path string
+	tls                            bool
+	proofs                         []string // every DPoP header value
+	forwardedHost, forwardedProto  []string // every X-Forwarded-Host and -Proto value
+}
+
 // proofResult is a proof that passed every check except the replay claim.
 type proofResult struct {
 	thumbprint string
@@ -158,8 +215,8 @@ type proofClaims struct {
 func proofRefusal(code, format string, args ...any) *Error { return refuse(code, format, args...) }
 
 // verifyProof checks the DPoP header of r against r and token. It records nothing.
-func verifyProof(r *http.Request, token string, env proofEnv) (proofResult, *Error) {
-	values := r.Header.Values(headerDPoP)
+func verifyProof(r proofRequest, token string, env proofEnv) (proofResult, *Error) {
+	values := r.proofs
 	switch {
 	case len(values) == 0 || strings.TrimSpace(values[0]) == "":
 		return proofResult{}, proofRefusal(CodeDPoPMissing, "the request carries no DPoP proof")
@@ -231,9 +288,9 @@ func proofKey(raw json.RawMessage, alg string) (verifyKey, *Error) {
 }
 
 // checkProofClaims checks what the proof states about this request.
-func (env proofEnv) checkProofClaims(pc proofClaims, r *http.Request, token string) *Error {
+func (env proofEnv) checkProofClaims(pc proofClaims, r proofRequest, token string) *Error {
 	now := env.now
-	if pc.HTM == "" || pc.HTM != r.Method {
+	if pc.HTM == "" || pc.HTM != r.method {
 		return proofRefusal(CodeDPoPMethod, "the DPoP proof is for another method")
 	}
 	if !urlMatches(pc.HTU, env.requestURL(r)) {
@@ -259,11 +316,11 @@ func (env proofEnv) checkProofClaims(pc proofClaims, r *http.Request, token stri
 }
 
 // requestURL is the URL the client addressed, for htu: the public URL when configured, else the
-// forwarded host and scheme when forwarding headers are trusted, else this request's own host.
-func (env proofEnv) requestURL(r *http.Request) string {
-	path := r.URL.EscapedPath()
-	if r.RequestURI != "" {
-		if u, err := url.ParseRequestURI(r.RequestURI); err == nil && u.EscapedPath() != "" {
+// forwarded host and scheme (the last entry) when forwarding headers are trusted, else this request's own host.
+func (env proofEnv) requestURL(r proofRequest) string {
+	path := r.path
+	if r.requestURI != "" {
+		if u, err := url.ParseRequestURI(r.requestURI); err == nil && u.EscapedPath() != "" {
 			path = u.EscapedPath()
 		}
 	}
@@ -271,8 +328,8 @@ func (env proofEnv) requestURL(r *http.Request) string {
 		return base + path
 	}
 	if env.trustForwarded {
-		if host := firstListValue(r.Header.Get("X-Forwarded-Host")); host != "" {
-			proto := strings.ToLower(firstListValue(r.Header.Get("X-Forwarded-Proto")))
+		if host := lastListValue(r.forwardedHost); host != "" {
+			proto := strings.ToLower(lastListValue(r.forwardedProto))
 			if proto != "http" {
 				proto = "https"
 			}
@@ -280,15 +337,23 @@ func (env proofEnv) requestURL(r *http.Request) string {
 		}
 	}
 	scheme := "http"
-	if r.TLS != nil {
+	if r.tls {
 		scheme = "https"
 	}
-	return scheme + "://" + r.Host + path
+	return scheme + "://" + r.host + path
 }
 
-func firstListValue(v string) string {
-	first, _, _ := strings.Cut(v, ",")
-	return strings.TrimSpace(first)
+// lastListValue is the last entry of a comma-separated header, across its lines: the one the proxy
+// nearest to this server appended. The entries before it are whatever the client sent.
+func lastListValue(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	v := values[len(values)-1]
+	if i := strings.LastIndex(v, ","); i >= 0 {
+		v = v[i+1:]
+	}
+	return strings.TrimSpace(v)
 }
 
 // urlMatches compares htu with the request URL per RFC 9449 section 4.3: scheme and host without

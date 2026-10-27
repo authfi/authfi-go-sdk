@@ -161,6 +161,9 @@ func (v *chainVerifier) validate(x5c []string, now time.Time) (*x509.Certificate
 	if !statesAny(leaf, tokenPolicies) {
 		return nil, time.Time{}, refuse(CodeChainPolicy, "the signing certificate states no AuthFI custody policy")
 	}
+	if statesOID(leaf, policySubjectHeld) {
+		return nil, time.Time{}, refuse(CodeChainPolicy, "the signing certificate also states the subject-held key policy")
+	}
 	roots, inter := x509.NewCertPool(), x509.NewCertPool()
 	roots.AddCert(anchor)
 	for _, c := range certs[1:] {
