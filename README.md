@@ -124,18 +124,19 @@ http.Handle("/ssf/push", recv) // the https URL you register as the stream endpo
 What the receiver does, in order, and what it refuses:
 
 - POST with `Content-Type: application/secevent+jwt`, at most 16 KiB; any other method is 405. If you set `AuthToken`, the push must carry that bearer (401 otherwise).
-- The SET is a JWS signed by a key in the project's key set (the one that verifies agent tokens), with `typ` `secevent+jwt`. `none`, HMAC and unknown keys are refused; a key set that cannot be read answers 503 so AuthFI retries.
-- `iss` is the configured issuer, `aud` includes your stream audience, `jti` and `iat` are present, `iat` is not in the future and not older than `TokenLifetime`, `exp` (if present) has not passed, `sub_id` names the subject, `events` holds objects.
+- The SET is a JWS signed by a key in the project's key set (the one that verifies agent tokens), with `typ` `secevent+jwt`. `none` and HMAC are refused. AuthFI treats a 400 as final and stops the stream, so a condition that can heal answers 503 and AuthFI retries: a key that is not in the key set yet (a rotation), a key set that cannot be read, or an `iat` more than 60 seconds ahead of this server's clock.
+- `iss` is the configured issuer, `aud` includes your stream audience, `jti` and `iat` are present, `iat` is present, `exp` (if present) has not passed, `sub_id` names the subject, `events` holds objects.
 - Accepted: `202`. Refused: `400` with `{"err": ..., "description": ...}` where `err` is `invalid_request`, `invalid_key`, `invalid_issuer`, `invalid_audience` or `authentication_failed`. Nothing is recorded for a refused SET.
+- A SET older than any token it could affect (`TokenLifetime` plus the clock leeway) is answered `202` and not applied.
 - A `jti` seen before is answered `202` and applied once, so AuthFI can retry a push whose answer was lost. The set of seen ids is bounded.
 
 `session-revoked`, `account-purged` and `credential-compromise` revoke the subject: tokens issued at or before the SET's `iat` are refused with code `token_revoked`, and a token issued after it is accepted. A delegated token is refused when its actor (`act.sub`) is revoked. A token with no `iat` is refused while its subject has a live revocation. `token-claims-change` with `resumed: true` reaches `OnSignal` with `Resumed` set and changes nothing else: a resumed agent mints a new token, which is newer than the revocation.
 
-`store.Revoke(subject, notBefore)` and `store.IsRevoked(subject, issuedAt)` are there for your own use. The store holds at most `MaxEntries` subjects (default 100,000) and forgets a revocation once it is older than `TokenLifetime`. When it is full it drops the oldest revocations and refuses every token issued before the newest one it dropped, whatever its subject, until that time passes `TokenLifetime`: a full store costs some holders a new token and never lets a revoked one through.
+`store.Revoke(subject, notBefore)` and `store.IsRevoked(subject, issuedAt)` are there for your own use. The store holds at most `MaxEntries` subjects (default 100,000) and forgets a revocation once it is older than `TokenLifetime` plus the clock leeway. `Verify` refuses a token that lives longer than `TokenLifetime` (code `sdk_not_configured`, HTTP 503 from the middleware): raise `TokenLifetime` to your longest token lifetime. When it is full it drops the oldest revocations and refuses every token issued before the newest one it dropped, whatever its subject, until that time passes `TokenLifetime`: a full store costs some holders a new token and never lets a revoked one through.
 
 To register the stream from code, `auth.RegisterStream(ctx, bearer, authfi.StreamRequest{Audience: "my-stream", EndpointURL: "https://api.example.com/ssf/push", AuthToken: pushBearer})` reads the issuer's `/.well-known/ssf-configuration` and posts the registration to the `configuration_endpoint` it names, which must be on the issuer's host. The bearer is a credential allowed to register streams.
 
-The store lives in memory: run one per process, and feed every replica (register one stream per replica or share the events yourself).
+The store lives in memory. A restart empties it, so until the tokens issued before the restart expire, a revoked agent is accepted again; a replica only learns of revocations pushed to its own endpoint. Run one stream per process and keep the token lifetime short.
 
 ## Cloud Credentials
 

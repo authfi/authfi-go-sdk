@@ -23,8 +23,9 @@ type RevocationOptions struct {
 	// MaxEntries caps the subjects remembered. Default DefaultRevocationEntries.
 	MaxEntries int
 	// TokenLifetime must be at least the longest lifetime of any token you accept: once a
-	// revocation is older than that, every token it could refuse has expired by itself, and the
-	// entry is dropped. Default DefaultTokenLifetime.
+	// revocation is older than that (plus the clock leeway), every token it could refuse has expired
+	// by itself, and the entry is dropped. Verify refuses a token that lives longer than this.
+	// Default DefaultTokenLifetime.
 	TokenLifetime time.Duration
 }
 
@@ -89,7 +90,11 @@ func (s *RevocationStore) Revoke(subject string, notBefore time.Time) (dropped i
 	return dropped
 }
 
-func (s *RevocationStore) lifeSeconds() int64 { return int64(s.life / time.Second) }
+// retention is how long a revocation matters: a token issued at the revocation can live for the
+// token lifetime and then still verifies for the clock leeway.
+func (s *RevocationStore) retention() time.Duration { return s.life + maxLeeway }
+
+func (s *RevocationStore) lifeSeconds() int64 { return int64(s.retention() / time.Second) }
 
 // makeRoomLocked drops expired entries, and if the store is still full, the oldest tenth.
 func (s *RevocationStore) makeRoomLocked(now int64) int {
@@ -168,6 +173,11 @@ func (c *Client) checkRevoked(cl *Claims) error {
 	var iat time.Time
 	if cl.IssuedAt > 0 {
 		iat = time.Unix(cl.IssuedAt, 0)
+		// The store forgets a revocation once the longest token it was told about has expired. A
+		// longer-lived token would outlive its revocation, so it is refused rather than trusted.
+		if cl.ExpiresAt-cl.IssuedAt > int64(st.life/time.Second) {
+			return refuse(CodeNotConfigured, "RevocationOptions.TokenLifetime (%s) is shorter than the lifetime of this token; raise it", st.life)
+		}
 	}
 	if st.IsRevoked(cl.Subject, iat) || (cl.Actor != "" && st.IsRevoked(cl.Actor, iat)) {
 		return refuse(CodeRevoked, "access for this subject was withdrawn after the token was issued")

@@ -299,7 +299,7 @@ func TestRefusedSETsRecordNothingAndNeverCallTheHook(t *testing.T) {
 			cj, _ := json.Marshal(c)
 			return p[0] + "." + b64(cj) + "." + p[2]
 		}, 400, "authentication_failed"},
-		{"unknown kid", func(g *rig) string { return g.f.mintSET(setSpec{header: map[string]any{"kid": "nope"}}) }, 400, "invalid_key"},
+		{"unknown kid is retryable, not final", func(g *rig) string { return g.f.mintSET(setSpec{header: map[string]any{"kid": "nope"}}) }, 503, "temporarily_unavailable"},
 		{"no kid", func(g *rig) string { return g.f.mintSET(setSpec{header: map[string]any{"kid": ""}}) }, 400, "invalid_key"},
 		{"alg none", func(g *rig) string { return g.f.mintSET(setSpec{header: map[string]any{"alg": "none"}}) }, 400, "invalid_key"},
 		{"alg does not match the key", func(g *rig) string { return g.f.mintSET(setSpec{header: map[string]any{"alg": "RS256"}}) }, 400, "invalid_key"},
@@ -325,16 +325,11 @@ func TestRefusedSETsRecordNothingAndNeverCallTheHook(t *testing.T) {
 			c["exp"] = now(g).Add(-10 * time.Minute).Unix()
 			return g.f.mintSET(setSpec{claims: c})
 		}, 400, "invalid_request"},
-		{"iat in the future", func(g *rig) string {
+		{"iat ahead of this clock is retryable, not final", func(g *rig) string {
 			c := g.f.goodSET(evSessionRevoked, nil)
 			c["iat"] = now(g).Add(10 * time.Minute).Unix()
 			return g.f.mintSET(setSpec{claims: c})
-		}, 400, "invalid_request"},
-		{"iat older than any token could live", func(g *rig) string {
-			c := g.f.goodSET(evSessionRevoked, nil)
-			c["iat"] = now(g).Add(-25 * time.Hour).Unix()
-			return g.f.mintSET(setSpec{claims: c})
-		}, 400, "invalid_request"},
+		}, 503, "temporarily_unavailable"},
 		{"no iat", func(g *rig) string { return g.f.mintSET(setSpec{dropClm: []string{"iat"}}) }, 400, "invalid_request"},
 		{"no jti", func(g *rig) string { return g.f.mintSET(setSpec{dropClm: []string{"jti"}}) }, 400, "invalid_request"},
 		{"no events", func(g *rig) string { return g.f.mintSET(setSpec{dropClm: []string{"events"}}) }, 400, "invalid_request"},
@@ -382,6 +377,71 @@ func TestRefusedSETsRecordNothingAndNeverCallTheHook(t *testing.T) {
 				t.Fatalf("nothing was revoked, the token must verify: %v", err)
 			}
 		})
+	}
+}
+
+func TestStaleSETIsAcceptedAndIgnored(t *testing.T) {
+	g := newRig(t)
+	c := g.f.goodSET(evSessionRevoked, nil)
+	c["iat"] = g.f.clock().Add(-25 * time.Hour).Unix() // beyond any token it could affect
+	wantAccepted(t, g.push(g.f.mintSET(setSpec{claims: c})))
+	if g.store.Len() != 0 || len(g.signals()) != 0 {
+		t.Fatal("a SET that can no longer affect any token must not be recorded")
+	}
+}
+
+func TestRotatedKeyInsideTheRefetchWindowIsRetryableNotFinal(t *testing.T) {
+	g := newRig(t)
+	wantAccepted(t, g.push(g.f.mintSET(setSpec{})))
+	g.f.add(&signer{kid: "ed2", alg: "EdDSA", ed: g.f.keys["ed1"].ed})
+	g.f.advance(2 * time.Second) // inside minRefetch
+	// 400 would be final for the transmitter, which disables the stream and loses the revocation.
+	wantErr(t, g.push(g.f.mintSET(setSpec{kid: "ed2"})), 503, "temporarily_unavailable")
+	g.f.advance(minRefetch)
+	wantAccepted(t, g.push(g.f.mintSET(setSpec{kid: "ed2"})))
+}
+
+func TestIssuerSpellingWithATrailingSlashIsTheSameIssuer(t *testing.T) {
+	g := newRig(t)
+	c := g.f.goodSET(evSessionRevoked, nil)
+	c["iss"] = g.f.issuer() + "/"
+	wantAccepted(t, g.push(g.f.mintSET(setSpec{claims: c})))
+	d := g.f.goodSET(evSessionRevoked, nil)
+	d["sub_id"] = map[string]any{"format": "iss_sub", "iss": g.f.issuer() + "/", "sub": "usr_8"}
+	wantAccepted(t, g.push(g.f.mintSET(setSpec{claims: d})))
+	mustCode(t, g.verify(g.tokenFor("usr_8", g.f.clock().Add(-time.Second), nil)), CodeRevoked)
+}
+
+func TestRevocationOutlivesTheLeewayOfTheTokenItCovers(t *testing.T) {
+	g := newRig(t, func(rc *ReceiverConfig) {})
+	g.store = NewRevocationStore(RevocationOptions{TokenLifetime: time.Hour})
+	g.store.now = g.f.clock
+	g.c = g.f.client(func(c *Config) { c.Revocations = g.store })
+	r, err := g.c.NewReceiver(ReceiverConfig{Audience: testStreamAudience})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.r = r
+	iat := g.f.clock()
+	tok := g.tokenFor(testAgentSubject, iat, map[string]any{"exp": iat.Add(time.Hour).Unix()})
+	wantAccepted(t, g.push(g.f.mintSET(setSpec{})))
+	mustCode(t, g.verify(tok), CodeRevoked)
+	// the token still verifies for its leeway past exp, so the revocation must outlive that too
+	g.f.advance(time.Hour + 30*time.Second)
+	mustCode(t, g.verify(tok), CodeRevoked)
+}
+
+func TestTokenLongerThanTheStoreLifetimeIsRefused(t *testing.T) {
+	g := newRig(t)
+	short := NewRevocationStore(RevocationOptions{TokenLifetime: time.Hour})
+	short.now = g.f.clock
+	c := g.f.client(func(c *Config) { c.Revocations = short })
+	long := g.tokenFor(testAgentSubject, g.f.clock(), map[string]any{"exp": g.f.clock().Add(2 * time.Hour).Unix()})
+	_, err := c.Verify(context.Background(), long)
+	mustCode(t, err, CodeNotConfigured)
+	fits := g.tokenFor(testAgentSubject, g.f.clock(), map[string]any{"exp": g.f.clock().Add(time.Hour).Unix()})
+	if _, err := c.Verify(context.Background(), fits); err != nil {
+		t.Fatalf("a token that fits the lifetime verifies: %v", err)
 	}
 }
 
@@ -589,7 +649,7 @@ func TestStoreMonotoneAndExpiring(t *testing.T) {
 	if !s.IsRevoked("a", now.Add(time.Minute)) || s.IsRevoked("a", now.Add(time.Minute+time.Second)) {
 		t.Fatal("line must rise to the later time and stop there")
 	}
-	now = now.Add(time.Hour + 2*time.Minute)
+	now = now.Add(time.Hour + maxLeeway + 2*time.Minute)
 	if s.IsRevoked("a", now.Add(-2*time.Hour)) {
 		t.Fatal("expired entries no longer refuse: every token they covered has expired")
 	}

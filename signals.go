@@ -192,7 +192,7 @@ func (r *Receiver) accept(ctx context.Context, token string) (status int, code, 
 	if err := json.Unmarshal(payload, &cl); err != nil {
 		return http.StatusBadRequest, errInvalidRequest, "the SET payload is not a JSON object of the expected shape"
 	}
-	if cl.Iss != trimIssuer(r.c.cfg.Issuer) {
+	if trimIssuer(cl.Iss) != trimIssuer(r.c.cfg.Issuer) {
 		return http.StatusBadRequest, errInvalidIssuer, "the SET was not issued by this project"
 	}
 	if !intersects(cl.Aud, []string{r.cfg.Audience}) {
@@ -207,10 +207,9 @@ func (r *Receiver) accept(ctx context.Context, token string) (status int, code, 
 	}
 	iat := cl.Iat.time()
 	if now.Add(leeway).Before(iat) {
-		return http.StatusBadRequest, errInvalidRequest, "the SET was issued in the future"
-	}
-	if !now.Before(iat.Add(r.store.life)) {
-		return http.StatusBadRequest, errInvalidRequest, "the SET is older than any token it could affect"
+		// Not a refusal of the SET: this server's clock is behind the transmitter's. A 400 is final
+		// for the transmitter and disables the stream, so ask for a retry instead.
+		return http.StatusServiceUnavailable, errTemporarilyAbort, "the SET is dated ahead of this server's clock"
 	}
 	if cl.Exp != nil && !now.Before(cl.Exp.time().Add(leeway)) {
 		return http.StatusBadRequest, errInvalidRequest, "the SET has expired"
@@ -228,6 +227,12 @@ func (r *Receiver) accept(ctx context.Context, token string) (status int, code, 
 		}
 	}
 
+	if !now.Before(iat.Add(r.store.retention())) {
+		// Every token this could refuse has expired: accepted so the transmitter does not take it
+		// for a failure, and not applied.
+		r.info("SET ignored: older than any token it could affect", "jti", cl.Jti)
+		return 0, "", ""
+	}
 	if !r.seen.claim(cl.Jti, now) {
 		return 0, "", "" // a retry of a SET already applied: accepted again, applied once
 	}
@@ -289,7 +294,7 @@ func (cl setClaims) subject(issuer string) (string, bool) {
 	case "opaque":
 		out = s.ID
 	case "iss_sub":
-		if s.Iss != trimIssuer(issuer) {
+		if trimIssuer(s.Iss) != trimIssuer(issuer) {
 			return "", false
 		}
 		out = s.Sub
@@ -310,9 +315,13 @@ func verifyFailure(err error) (int, string, string) {
 	switch e.Code {
 	case CodeKeySetUnavailable, CodeNotConfigured:
 		return http.StatusServiceUnavailable, errTemporarilyAbort, "the issuer's keys could not be read"
+	case CodeUnknownKey:
+		// The key may be one the issuer rotated in since the last fetch, which is throttled. A 400
+		// is final for the transmitter and would lose this revocation, so ask for a retry.
+		return http.StatusServiceUnavailable, errTemporarilyAbort, "the signing key is not in the issuer's key set (yet)"
 	case CodeSignatureInvalid:
 		return http.StatusBadRequest, errAuthnFailed, "the signature does not verify"
-	case CodeUnknownKey, CodeKeyIDRequired, CodeAlgNotAllowed, CodeAlgKeyMismatch, CodeCritNotSupported:
+	case CodeKeyIDRequired, CodeAlgNotAllowed, CodeAlgKeyMismatch, CodeCritNotSupported:
 		return http.StatusBadRequest, errInvalidKey, "the key or algorithm of the SET is not accepted"
 	}
 	return http.StatusBadRequest, errInvalidRequest, "the SET is not a well-formed " + setTyp
