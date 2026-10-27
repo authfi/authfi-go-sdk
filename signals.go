@@ -247,7 +247,7 @@ func (r *Receiver) apply(cl setClaims, subject string, iat time.Time) {
 		switch ev {
 		case EventSessionRevoked, EventAccountPurged, EventCredentialCompromise:
 			sig.Revoked = true
-			if n := r.store.Revoke(subject, iat); n > 0 {
+			if n := r.store.RevokeRef(subject, iat, cl.Jti); n > 0 {
 				r.log("revocation store is full; the oldest revocations were folded into a floor", "dropped", n)
 			}
 		case EventTokenClaimsChange:

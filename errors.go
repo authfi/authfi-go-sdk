@@ -37,13 +37,20 @@ type Error struct {
 	Code    string
 	Message string
 	Err     error
+	// Ref is the reference of the decision behind the refusal: for token_revoked, the jti of the
+	// Security Event Token that withdrew the subject. Empty when there is none.
+	Ref string
 }
 
 func (e *Error) Error() string {
-	if e.Message == "" {
-		return "authfi: " + e.Code
+	text := "authfi: " + e.Code
+	if e.Message != "" {
+		text = fmt.Sprintf("authfi: %s: %s", e.Code, e.Message)
 	}
-	return fmt.Sprintf("authfi: %s: %s", e.Code, e.Message)
+	if e.Ref != "" {
+		text += " (ref " + e.Ref + ")"
+	}
+	return text
 }
 
 func (e *Error) Unwrap() error { return e.Err }

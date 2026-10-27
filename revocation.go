@@ -41,9 +41,16 @@ type RevocationStore struct {
 	life time.Duration
 	now  func() time.Time // tests only
 
-	mu    sync.RWMutex
-	nb    map[string]int64 // subject -> not-before, Unix seconds
-	floor int64            // Unix seconds; zero when no entry was ever dropped for room
+	mu       sync.RWMutex
+	nb       map[string]revocation // subject -> its revocation
+	floor    int64                 // Unix seconds; zero when no entry was ever dropped for room
+	floorRef string                // the reference of the revocation the floor was raised to
+}
+
+// revocation is one subject's not-before time (Unix seconds) and the reference of the SET that set it.
+type revocation struct {
+	at  int64
+	ref string
 }
 
 // NewRevocationStore builds an empty store.
@@ -54,7 +61,7 @@ func NewRevocationStore(o RevocationOptions) *RevocationStore {
 	if o.TokenLifetime <= 0 {
 		o.TokenLifetime = DefaultTokenLifetime
 	}
-	return &RevocationStore{max: o.MaxEntries, life: o.TokenLifetime, nb: make(map[string]int64)}
+	return &RevocationStore{max: o.MaxEntries, life: o.TokenLifetime, nb: make(map[string]revocation)}
 }
 
 func (s *RevocationStore) clock() time.Time {
@@ -68,6 +75,12 @@ func (s *RevocationStore) clock() time.Time {
 // an earlier time changes nothing. It returns how many other subjects were dropped to make room
 // (see the type comment); zero in normal operation.
 func (s *RevocationStore) Revoke(subject string, notBefore time.Time) (dropped int) {
+	return s.RevokeRef(subject, notBefore, "")
+}
+
+// RevokeRef is Revoke with the reference of the decision, the jti of the SET that withdrew the
+// subject. A token refused because of it carries the reference in Error.Ref.
+func (s *RevocationStore) RevokeRef(subject string, notBefore time.Time, ref string) (dropped int) {
 	if s == nil || subject == "" {
 		return 0
 	}
@@ -78,15 +91,15 @@ func (s *RevocationStore) Revoke(subject string, notBefore time.Time) (dropped i
 		return 0 // every token this could refuse has already expired
 	}
 	if cur, ok := s.nb[subject]; ok {
-		if at > cur {
-			s.nb[subject] = at
+		if at > cur.at {
+			s.nb[subject] = revocation{at, ref}
 		}
 		return 0
 	}
 	if len(s.nb) >= s.max {
 		dropped = s.makeRoomLocked(now)
 	}
-	s.nb[subject] = at
+	s.nb[subject] = revocation{at, ref}
 	return dropped
 }
 
@@ -100,8 +113,8 @@ func (s *RevocationStore) lifeSeconds() int64 { return int64(s.retention() / tim
 // makeRoomLocked drops expired entries, and if the store is still full, the oldest tenth.
 func (s *RevocationStore) makeRoomLocked(now int64) int {
 	life := s.lifeSeconds()
-	for k, at := range s.nb {
-		if at+life <= now {
+	for k, r := range s.nb {
+		if r.at+life <= now {
 			delete(s.nb, k)
 		}
 	}
@@ -110,11 +123,11 @@ func (s *RevocationStore) makeRoomLocked(now int64) int {
 	}
 	type entry struct {
 		subject string
-		at      int64
+		revocation
 	}
 	all := make([]entry, 0, len(s.nb))
-	for k, at := range s.nb {
-		all = append(all, entry{k, at})
+	for k, r := range s.nb {
+		all = append(all, entry{k, r})
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].at < all[j].at })
 	n := s.max/evictFraction + 1
@@ -124,8 +137,8 @@ func (s *RevocationStore) makeRoomLocked(now int64) int {
 	for _, e := range all[:n] {
 		delete(s.nb, e.subject)
 	}
-	if last := all[n-1].at; last > s.floor {
-		s.floor = last
+	if last := all[n-1]; last.at > s.floor {
+		s.floor, s.floorRef = last.at, last.ref
 	}
 	return n
 }
@@ -134,8 +147,14 @@ func (s *RevocationStore) makeRoomLocked(now int64) int {
 // means the issue time is unknown: it counts as older than every revocation, so it is revoked
 // whenever the subject has a live one, because it cannot be shown to be newer.
 func (s *RevocationStore) IsRevoked(subject string, issuedAt time.Time) bool {
+	_, revoked := s.Revoked(subject, issuedAt)
+	return revoked
+}
+
+// Revoked is IsRevoked that also returns the reference of the revocation that applies.
+func (s *RevocationStore) Revoked(subject string, issuedAt time.Time) (ref string, revoked bool) {
 	if s == nil {
-		return false
+		return "", false
 	}
 	now := s.clock().Unix()
 	life := s.lifeSeconds()
@@ -145,13 +164,13 @@ func (s *RevocationStore) IsRevoked(subject string, issuedAt time.Time) bool {
 	// is covered by every live one.
 	iat := issuedAt.Unix()
 	if s.floor != 0 && s.floor+life > now && iat <= s.floor {
-		return true
+		return s.floorRef, true
 	}
-	at, ok := s.nb[subject]
-	if !ok || at+life <= now {
-		return false
+	r, ok := s.nb[subject]
+	if !ok || r.at+life <= now {
+		return "", false
 	}
-	return iat <= at
+	return r.ref, iat <= r.at
 }
 
 // Len is the number of subjects remembered, expired ones included until they are next swept.
@@ -182,8 +201,14 @@ func (c *Client) checkRevoked(cl *Claims) error {
 	if cl.ExpiresAt-cl.IssuedAt > int64(st.life/time.Second) {
 		return refuse(CodeNotConfigured, "RevocationOptions.TokenLifetime (%s) is shorter than the lifetime of this token; raise it", st.life)
 	}
-	if st.IsRevoked(cl.Subject, iat) || (cl.Actor != "" && st.IsRevoked(cl.Actor, iat)) {
-		return refuse(CodeRevoked, "access for this subject was withdrawn after the token was issued")
+	ref, revoked := st.Revoked(cl.Subject, iat)
+	if !revoked && cl.Actor != "" {
+		ref, revoked = st.Revoked(cl.Actor, iat)
+	}
+	if revoked {
+		e := refuse(CodeRevoked, "access for this subject was withdrawn after the token was issued")
+		e.Ref = ref
+		return e
 	}
 	return nil
 }

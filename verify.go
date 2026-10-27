@@ -86,12 +86,12 @@ func (c *Client) VerifyToken(token string) (*Claims, error) {
 func (c *Client) Verify(ctx context.Context, token string) (*Claims, error) {
 	claims, err := c.verify(ctx, token)
 	if err != nil && c.cfg.Logger != nil {
-		code := CodeMalformed
+		code, ref := CodeMalformed, ""
 		var e *Error
 		if errors.As(err, &e) {
-			code = e.Code
+			code, ref = e.Code, e.Ref
 		}
-		c.cfg.Logger.Debug("authfi: token refused", "code", code)
+		c.cfg.Logger.Debug("authfi: token refused", "code", code, "ref", ref)
 	}
 	return claims, err
 }
