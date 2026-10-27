@@ -199,9 +199,8 @@ func TestEveryRevokingEventRevokes(t *testing.T) {
 func TestDelegatedTokenIsRefusedWhenItsActorIsRevoked(t *testing.T) {
 	g := newRig(t)
 	tok := g.tokenFor("usr_7", g.f.clock().Add(-time.Second), map[string]any{"act": map[string]any{"sub": testAgentSubject}})
-	if err := g.verify(tok); err != nil {
-		t.Fatal(err)
-	}
+	// Before the revocation it is refused only because an agent token's proof needs its request, never as revoked.
+	mustCode(t, g.verify(tok), CodeAgentNeedsRequest)
 	wantAccepted(t, g.push(g.f.mintSET(setSpec{})))
 	mustCode(t, g.verify(tok), CodeRevoked)
 	// the person's own token, with no agent acting, is not touched

@@ -46,7 +46,9 @@ type signer struct {
 	rsa      *rsa.PrivateKey
 	ec       *ecdsa.PrivateKey
 	ed       ed25519.PrivateKey
-	salt     int // PS256 salt length; 0 means the standard one (equal to the hash)
+	salt     int      // PS256 salt length; 0 means the standard one (equal to the hash)
+	x5c      []string // published certificate chain, base64 DER
+	x5t      string   // published x5t#S256
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -110,14 +112,14 @@ func (f *fixture) serve(w http.ResponseWriter, r *http.Request) {
 	st := int(f.status.Load())
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	keys := []map[string]string{}
+	keys := []map[string]any{}
 	for _, s := range f.keys {
 		if !f.empty.Load() {
-			keys = append(keys, s.jwk())
+			keys = append(keys, s.publishedJWK())
 		}
 	}
 	if f.big.Load() {
-		keys = append(keys, map[string]string{"kty": "oct", "kid": "pad", "k": strings.Repeat("A", 2<<20)})
+		keys = append(keys, map[string]any{"kty": "oct", "kid": "pad", "k": strings.Repeat("A", 2<<20)})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if st != 0 {
@@ -127,6 +129,20 @@ func (f *fixture) serve(w http.ResponseWriter, r *http.Request) {
 }
 
 func b64(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
+
+func (s *signer) publishedJWK() map[string]any {
+	out := map[string]any{}
+	for k, v := range s.jwk() {
+		out[k] = v
+	}
+	if s.x5c != nil {
+		out["x5c"] = s.x5c
+	}
+	if s.x5t != "" {
+		out["x5t#S256"] = s.x5t
+	}
+	return out
+}
 
 func (s *signer) jwk() map[string]string {
 	switch {

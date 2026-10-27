@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	authfi "github.com/authfi/authfi-go-sdk"
@@ -40,6 +41,10 @@ type Agent struct {
 	http     *http.Client
 	resource string
 	log      *slog.Logger
+	dpop     *Key // WithDPoP: the key token requests are proved with, and tokens are bound to
+
+	nonceMu    sync.Mutex
+	tokenNonce string // the latest DPoP nonce the token endpoint sent
 
 	now   func() time.Time
 	sleep func(context.Context, time.Duration) error
@@ -240,6 +245,7 @@ func (a *Agent) sameHost(raw, what string) (string, error) {
 type reply struct {
 	status int
 	body   []byte
+	nonce  string // the DPoP-Nonce header, when the endpoint sent one
 }
 
 func (a *Agent) do(req *http.Request) (reply, error) {
@@ -253,7 +259,7 @@ func (a *Agent) do(req *http.Request) (reply, error) {
 	if err != nil || len(body) > maxReply {
 		return reply{}, errors.New("the reply could not be read")
 	}
-	return reply{status: resp.StatusCode, body: body}, nil
+	return reply{status: resp.StatusCode, body: body, nonce: resp.Header.Get(headerDPoPNonce)}, nil
 }
 
 // scrubbedNetError keeps the failure and drops the URL, which may carry a query a caller built.
@@ -360,11 +366,7 @@ func (a *Agent) mint(ctx context.Context) (Token, error) {
 		if a.resource != "" {
 			fields.Set("resource", a.resource)
 		}
-		form, assertion, err := a.authForm(ep.token, fields)
-		if err != nil {
-			return Token{}, err
-		}
-		r, err := a.postForm(ctx, ep.token, form)
+		r, assertion, err := a.postToken(ctx, ep.token, fields)
 		if err != nil {
 			if ctx.Err() != nil {
 				return Token{}, ctx.Err()
@@ -379,6 +381,52 @@ func (a *Agent) mint(ctx context.Context) (Token, error) {
 		return parseToken(r.status, r.body, a.now(), assertion.Reveal())
 	}
 	return Token{}, last
+}
+
+// postToken sends a token request with a fresh assertion. With WithDPoP it carries a proof of the
+// DPoP key, and when the endpoint answers that it wants a nonce it is sent once more with it.
+func (a *Agent) postToken(ctx context.Context, endpoint string, fields url.Values) (reply, authfi.Secret, error) {
+	r, assertion, err := a.postTokenOnce(ctx, endpoint, fields)
+	if err == nil && a.dpop != nil && r.nonce != "" {
+		a.setNonce(r.nonce)
+		if r.status == http.StatusBadRequest || r.status == http.StatusUnauthorized {
+			return a.postTokenOnce(ctx, endpoint, fields)
+		}
+	}
+	return r, assertion, err
+}
+
+func (a *Agent) postTokenOnce(ctx context.Context, endpoint string, fields url.Values) (reply, authfi.Secret, error) {
+	form, assertion, err := a.authForm(endpoint, fields)
+	if err != nil {
+		return reply{}, authfi.Secret{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return reply{}, assertion, errors.New("bad URL")
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if a.dpop != nil {
+		proof, err := a.dpop.dpopProof(http.MethodPost, proofURL(req.URL), "", a.getNonce(), a.now())
+		if err != nil {
+			return reply{}, assertion, err
+		}
+		req.Header.Set(headerDPoP, proof)
+	}
+	r, err := a.do(req)
+	return r, assertion, err
+}
+
+func (a *Agent) getNonce() string {
+	a.nonceMu.Lock()
+	defer a.nonceMu.Unlock()
+	return a.tokenNonce
+}
+
+func (a *Agent) setNonce(n string) {
+	a.nonceMu.Lock()
+	a.tokenNonce = n
+	a.nonceMu.Unlock()
 }
 
 // TokenSource is the agent's own token as an oauth2.TokenSource, for libraries that take one. It

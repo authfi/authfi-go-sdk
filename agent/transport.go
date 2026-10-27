@@ -3,9 +3,11 @@ package agent
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/oauth2"
@@ -19,6 +21,8 @@ type transport struct {
 	src     oauth2.TokenSource
 	base    http.RoundTripper
 	origins map[string]bool
+	dpop    *Key    // when set, tokens go as DPoP with a proof of this key
+	nonces  *nonces // the nonces resources asked for, with dpop
 }
 
 // Transport returns an http.RoundTripper that puts the current token of src on every request as
@@ -64,11 +68,16 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	out := req.Clone(req.Context()) // a RoundTripper must not modify the caller's request
 	for k := range out.Header {
-		if strings.EqualFold(k, "x-api-key") || strings.EqualFold(k, "authorization") {
+		if strings.EqualFold(k, "x-api-key") || strings.EqualFold(k, "authorization") || strings.EqualFold(k, headerDPoP) {
 			delete(out.Header, k) // a header set without canonical casing would otherwise survive
 		}
 	}
-	out.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+	if t.dpop == nil {
+		out.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+	} else if err := t.bindToKey(out, tok.AccessToken); err != nil {
+		closeBody(req)
+		return nil, err
+	}
 	if sc := trace.SpanContextFromContext(req.Context()); sc.IsValid() {
 		if out.Header.Get("traceparent") == "" {
 			out.Header.Set("traceparent", fmt.Sprintf("00-%s-%s-%s", sc.TraceID(), sc.SpanID(), sc.TraceFlags()))
@@ -77,7 +86,56 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			out.Header.Set("X-Request-Id", fmt.Sprintf("otel-%s-%s", sc.TraceID(), sc.SpanID()))
 		}
 	}
-	return t.base.RoundTrip(out)
+	resp, err := t.base.RoundTrip(out)
+	if err != nil || t.dpop == nil {
+		return resp, err
+	}
+	return t.retryWithNonce(req, out, resp, tok.AccessToken)
+}
+
+// bindToKey sets Authorization: DPoP and a proof of the transport's key for req.
+func (t *transport) bindToKey(req *http.Request, token string) error {
+	proof, err := t.dpop.dpopProof(req.Method, proofURL(req.URL), token, t.nonces.get(req.URL.Scheme+"://"+req.URL.Host), time.Now())
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "DPoP "+token)
+	req.Header.Set(headerDPoP, proof)
+	return nil
+}
+
+// retryWithNonce remembers a nonce the resource sent and, when it refused for lack of one, sends the
+// request once more with it. A request whose body cannot be replayed is not retried.
+func (t *transport) retryWithNonce(orig, sent *http.Request, resp *http.Response, token string) (*http.Response, error) {
+	nonce := resp.Header.Get(headerDPoPNonce)
+	if nonce == "" {
+		return resp, nil
+	}
+	origin := sent.URL.Scheme + "://" + sent.URL.Host
+	had := t.nonces.get(origin)
+	t.nonces.set(origin, nonce)
+	if resp.StatusCode != http.StatusUnauthorized || nonce == had || (orig.Body != nil && orig.GetBody == nil) {
+		return resp, nil
+	}
+	retry := orig.Clone(orig.Context())
+	if orig.Body != nil {
+		body, err := orig.GetBody()
+		if err != nil {
+			return resp, nil
+		}
+		retry.Body = body
+	}
+	for k := range retry.Header {
+		if strings.EqualFold(k, "x-api-key") || strings.EqualFold(k, "authorization") || strings.EqualFold(k, headerDPoP) {
+			delete(retry.Header, k)
+		}
+	}
+	if err := t.bindToKey(retry, token); err != nil {
+		return resp, nil
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxReply))
+	_ = resp.Body.Close()
+	return t.base.RoundTrip(retry)
 }
 
 // closeBody closes a request body the transport will not send: RoundTripper must always close it.
