@@ -28,6 +28,7 @@ const (
 	CodeKeySetUnavailable  = "jwks_unavailable"
 	CodeMissingBearer      = "missing_authorization"
 	CodeRevoked            = "token_revoked"
+	CodeIssuedAtRequired   = "token_iat_required"
 )
 
 // Error is a refusal or failure with a stable Code. Use errors.As to read it. Its text never

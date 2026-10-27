@@ -92,7 +92,8 @@ func (s *RevocationStore) Revoke(subject string, notBefore time.Time) (dropped i
 
 // retention is how long a revocation matters: a token issued at the revocation can live for the
 // token lifetime and then still verifies for the clock leeway.
-func (s *RevocationStore) retention() time.Duration { return s.life + maxLeeway }
+// The extra second covers an exp that is a fraction past a whole second.
+func (s *RevocationStore) retention() time.Duration { return s.life + maxLeeway + time.Second }
 
 func (s *RevocationStore) lifeSeconds() int64 { return int64(s.retention() / time.Second) }
 
@@ -170,14 +171,16 @@ func (c *Client) checkRevoked(cl *Claims) error {
 	if st == nil {
 		return nil
 	}
-	var iat time.Time
-	if cl.IssuedAt > 0 {
-		iat = time.Unix(cl.IssuedAt, 0)
-		// The store forgets a revocation once the longest token it was told about has expired. A
-		// longer-lived token would outlive its revocation, so it is refused rather than trusted.
-		if cl.ExpiresAt-cl.IssuedAt > int64(st.life/time.Second) {
-			return refuse(CodeNotConfigured, "RevocationOptions.TokenLifetime (%s) is shorter than the lifetime of this token; raise it", st.life)
-		}
+	// A token with no issue time cannot be placed before or after a revocation, and its lifetime
+	// cannot be bounded: with a store configured it is refused.
+	if cl.IssuedAt <= 0 {
+		return refuse(CodeIssuedAtRequired, "the token has no issue time, which revocation needs")
+	}
+	iat := time.Unix(cl.IssuedAt, 0)
+	// The store forgets a revocation once the longest token it was told about has expired. A
+	// longer-lived token would outlive its revocation, so it is refused rather than trusted.
+	if cl.ExpiresAt-cl.IssuedAt > int64(st.life/time.Second) {
+		return refuse(CodeNotConfigured, "RevocationOptions.TokenLifetime (%s) is shorter than the lifetime of this token; raise it", st.life)
 	}
 	if st.IsRevoked(cl.Subject, iat) || (cl.Actor != "" && st.IsRevoked(cl.Actor, iat)) {
 		return refuse(CodeRevoked, "access for this subject was withdrawn after the token was issued")

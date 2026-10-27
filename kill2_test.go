@@ -56,7 +56,7 @@ func TestKillExpiryIsExclusiveAtExactlyOneLifetime(t *testing.T) {
 	t0 := *now
 	s.Revoke("a", t0)
 	s.Revoke("b", t0.Add(100*time.Second))
-	*now = t0.Add(time.Hour + maxLeeway)
+	*now = t0.Add(time.Hour + maxLeeway + time.Second)
 	if s.IsRevoked("a", time.Unix(0, 0)) {
 		t.Fatal("IsRevoked: expired at exactly one lifetime")
 	}

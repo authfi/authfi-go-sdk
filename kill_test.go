@@ -230,8 +230,8 @@ func TestKillStaleBoundaryIsExactlyTheRetention(t *testing.T) {
 		age     time.Duration
 		applied bool
 	}{
-		{DefaultTokenLifetime + maxLeeway, false},
-		{DefaultTokenLifetime + maxLeeway - time.Second, true},
+		{DefaultTokenLifetime + maxLeeway + time.Second, false},
+		{DefaultTokenLifetime + maxLeeway, true},
 	} {
 		g := newRig(t)
 		c := g.f.goodSET(evSessionRevoked, nil)

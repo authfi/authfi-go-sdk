@@ -210,15 +210,15 @@ func TestDelegatedTokenIsRefusedWhenItsActorIsRevoked(t *testing.T) {
 	}
 }
 
-func TestTokenWithoutIatIsRefusedOnceItsSubjectIsRevoked(t *testing.T) {
+func TestTokenWithoutIatIsRefusedWhenAStoreIsConfigured(t *testing.T) {
 	g := newRig(t)
-	g.f.t.Helper()
-	wantAccepted(t, g.push(g.f.mintSET(setSpec{})))
-	tok := g.f.mint(tokenSpec{claims: map[string]any{"sub": testAgentSubject}, dropClm: []string{"iat"}})
-	mustCode(t, g.verify(tok), CodeRevoked)
-	other := g.f.mint(tokenSpec{claims: map[string]any{"sub": "agent:agt_9"}, dropClm: []string{"iat"}})
-	if err := g.verify(other); err != nil {
-		t.Fatalf("no revocation for this subject: %v", err)
+	for _, sub := range []string{testAgentSubject, "agent:agt_9"} {
+		tok := g.f.mint(tokenSpec{claims: map[string]any{"sub": sub}, dropClm: []string{"iat"}})
+		mustCode(t, g.verify(tok), CodeIssuedAtRequired) // it cannot be placed before or after a revocation
+	}
+	// without a store the same token verifies, as before
+	if _, err := g.f.client().Verify(context.Background(), g.f.mint(tokenSpec{dropClm: []string{"iat"}})); err != nil {
+		t.Fatal(err)
 	}
 }
 
