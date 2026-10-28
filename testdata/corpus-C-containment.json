@@ -1,0 +1,136 @@
+{
+ "track": "C",
+ "invariant": "I7",
+ "cases": [
+  {
+   "id": "set-forged-signature",
+   "component": "go-sdk,node-sdk",
+   "kind": "revocation_scenario",
+   "expect_code": "authentication_failed",
+   "why": "a SET whose signature was altered revokes nothing"
+  },
+  {
+   "id": "set-other-aud",
+   "component": "go-sdk,node-sdk",
+   "kind": "revocation_scenario",
+   "expect_code": "invalid_audience",
+   "why": "a SET for another stream is refused"
+  },
+  {
+   "id": "set-other-iss",
+   "component": "go-sdk,node-sdk",
+   "kind": "revocation_scenario",
+   "expect_code": "invalid_issuer",
+   "why": "a SET from another project is refused"
+  },
+  {
+   "id": "set-replayed-jti",
+   "component": "go-sdk,node-sdk",
+   "kind": "revocation_scenario",
+   "expect_accept": true,
+   "why": "a retry of an applied SET is answered 202 and applied once (the transmitter retries when it loses our answer)"
+  },
+  {
+   "id": "set-expired",
+   "component": "go-sdk,node-sdk",
+   "kind": "revocation_scenario",
+   "expect_code": "invalid_request",
+   "why": "a SET whose exp has passed is refused"
+  },
+  {
+   "id": "set-alg-none",
+   "component": "go-sdk,node-sdk",
+   "kind": "revocation_scenario",
+   "expect_code": "invalid_key",
+   "why": "alg none is never accepted"
+  },
+  {
+   "id": "set-alg-hs256-confusion",
+   "component": "go-sdk,node-sdk",
+   "kind": "revocation_scenario",
+   "expect_code": "invalid_key",
+   "why": "alg HS256 with a public key as the secret is never accepted"
+  },
+  {
+   "id": "set-kid-not-in-jwks",
+   "component": "go-sdk,node-sdk",
+   "kind": "revocation_scenario",
+   "expect_code": "temporarily_unavailable",
+   "why": "an unknown kid is retryable (a rotation inside the refetch window), never a final 400: the transmitter disables a stream on 400"
+  },
+  {
+   "id": "token-issued-before-revocation",
+   "component": "go-sdk,node-sdk",
+   "kind": "revocation_scenario",
+   "expect_code": "token_revoked",
+   "expect_ref": true,
+   "why": "a token issued at or before the revocation is refused and the refusal names the revoking SET jti (I1)"
+  },
+  {
+   "id": "token-issued-after-revocation-resume",
+   "component": "go-sdk,node-sdk",
+   "kind": "revocation_scenario",
+   "expect_accept": true,
+   "why": "after a resume a token issued after the revocation works, and the old one stays refused"
+  },
+  {
+   "id": "token-delegated-actor-revoked",
+   "component": "go-sdk,node-sdk",
+   "kind": "revocation_scenario",
+   "expect_code": "token_revoked",
+   "expect_ref": true,
+   "why": "a delegated token whose act.sub is revoked is refused (I1: ref carried)"
+  },
+  {
+   "id": "subject-case-variant",
+   "component": "go-sdk,node-sdk",
+   "kind": "revocation_scenario",
+   "expect_accept": true,
+   "why": "subjects match exactly: AGENT:AGT_42 is another principal than agent:agt_42, and the transmitter always sends agent:<id>"
+  },
+  {
+   "id": "subject-prefix-missing",
+   "component": "go-sdk,node-sdk",
+   "kind": "revocation_scenario",
+   "expect_accept": true,
+   "why": "subjects match exactly: a bare agt_42 in a SET does not revoke agent:agt_42; the transmitter always sends the agent: prefix"
+  },
+  {
+   "id": "body-oversize",
+   "component": "go-sdk,node-sdk",
+   "kind": "revocation_scenario",
+   "expect_code": "invalid_request",
+   "why": "a body past 16 KiB is refused"
+  },
+  {
+   "id": "content-type-wrong",
+   "component": "go-sdk,node-sdk",
+   "kind": "revocation_scenario",
+   "expect_code": "invalid_request",
+   "why": "only application/secevent+jwt is accepted"
+  },
+  {
+   "id": "flood-past-store-cap",
+   "component": "go-sdk,node-sdk",
+   "kind": "revocation_scenario",
+   "expect_code": "token_revoked",
+   "expect_ref": true,
+   "why": "a flood past the store cap drops the oldest entry but raises a floor, so a live revocation is never forgotten within the token lifetime"
+  },
+  {
+   "id": "set-alg-key-mismatch",
+   "component": "go-sdk,node-sdk",
+   "kind": "revocation_scenario",
+   "expect_code": "invalid_key",
+   "why": "a header alg the signing key may not use (RS256 on an Ed25519 key) is refused: algorithm confusion"
+  },
+  {
+   "id": "token-issued-same-second",
+   "component": "go-sdk,node-sdk",
+   "kind": "revocation_scenario",
+   "expect_code": "token_revoked",
+   "expect_ref": true,
+   "why": "a token issued in the same second as the revocation cannot be shown to be newer, so it is refused"
+  }
+ ]
+}

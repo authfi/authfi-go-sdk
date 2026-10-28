@@ -27,6 +27,8 @@ const (
 	CodeActChainNotAllowed = "token_act_chain_unsupported"
 	CodeKeySetUnavailable  = "jwks_unavailable"
 	CodeMissingBearer      = "missing_authorization"
+	CodeRevoked            = "token_revoked"
+	CodeIssuedAtRequired   = "token_iat_required"
 )
 
 // Error is a refusal or failure with a stable Code. Use errors.As to read it. Its text never
@@ -35,13 +37,20 @@ type Error struct {
 	Code    string
 	Message string
 	Err     error
+	// Ref is the reference of the decision behind the refusal: for token_revoked, the jti of the
+	// Security Event Token that withdrew the subject. Empty when there is none.
+	Ref string
 }
 
 func (e *Error) Error() string {
-	if e.Message == "" {
-		return "authfi: " + e.Code
+	text := "authfi: " + e.Code
+	if e.Message != "" {
+		text = fmt.Sprintf("authfi: %s: %s", e.Code, e.Message)
 	}
-	return fmt.Sprintf("authfi: %s: %s", e.Code, e.Message)
+	if e.Ref != "" {
+		text += " (ref " + e.Ref + ")"
+	}
+	return text
 }
 
 func (e *Error) Unwrap() error { return e.Err }
