@@ -52,10 +52,51 @@ func usersHandler(w http.ResponseWriter, r *http.Request) {
 - `iss` is the configured issuer and `aud` includes one of the configured audiences. The audience is required, and AuthFI's own audiences (the issuer, anything under it, `authfi-console`, `authfi-workspace`) are refused: mint the token for your API with `resource=<your API's client id>`;
 - `exp` is present and in the future, with 60 seconds of leeway (`Config.Leeway`), and `nbf` and `iat` hold;
 - `sub` and `tenant_id` are present, and `tenant_id` equals `TenantID` when you set it;
-- it is not bound to a key (`cnf`, `authfi_mandate`) and carries no delegation chain.
+- a token bound to a key (`cnf`, `authfi_mandate`) comes with a DPoP proof for that key, and an agent token also passes the checks in [Agent tokens](#agent-tokens); a delegation chain (an `act` inside an `act`) is refused.
 - with `Config.Revocations` set, neither its subject nor its actor was revoked after it was issued (see Revocation).
 
 A refusal is an `*authfi.Error`; read `Code` with `errors.As`. Nothing from the token is in the message.
+
+## Agent tokens
+
+An agent token has an `agt_` subject or `client_id`, or an `act` claim. For these the SDK checks, by default, what a bearer check cannot:
+
+1. **Proof of possession (RFC 9449).** The token carries `cnf.jkt` and arrives as `Authorization: DPoP <token>` with exactly one `DPoP` header: a `dpop+jwt` proof signed with EdDSA, ES256 or PS256 by the key whose thumbprint is `cnf.jkt`, naming this request's method and URL (`htm`, `htu`), issued within the last 60 seconds (5 s of clock skew ahead), carrying the hash of this token (`ath`), and never seen before for that key (`jti`).
+2. **Custody of the signing key.** The key set's `x5c` chain certifies the key that signed the token, `x5t#S256` in the token header and the key set equals that certificate, the chain ends at a root pinned by the SHA-256 of its public key (AuthFI Root CA R1 by default), the certificate states AuthFI policy `1.3.6.1.4.1.67322.1.1` or `.1.2`, every CA between states one of them, and the leaf is a signing certificate, not a CA.
+
+A person's bearer token is verified exactly as before. Use `VerifyRequest(r)` or the middleware (`Require`, `RequireRole`, `Authenticate`): they read both schemes. `Verify(ctx, token)` has no request to hold a proof against and refuses an agent token with `agent_token_needs_request`.
+
+| `Config` field | Meaning |
+|---|---|
+| `AgentTokens` | `AgentEnforce` (the zero value) refuses an agent token that fails a check; `AgentWatch` accepts it and logs the refusal code once per key and reason a minute; `AgentOff` skips the agent checks and has to be set explicitly. A token bound to a key always needs its proof. |
+| `PublicURL` | The URL clients call, for example `https://api.acme.com` (a path prefix is allowed). The proof's `htu` must match it plus the request path. Without it the request's own `Host` and TLS state are used. |
+| `TrustForwarded` | Read `X-Forwarded-Host` and `X-Forwarded-Proto` for the URL. Off by default; set it only behind a proxy that overwrites both. |
+| `ReplayGuard` | Where seen proofs are kept (`Claim(ctx, id, until) (fresh bool, err error)`). The default is bounded and lives in the process, so it is right for one replica: with several replicas give them one shared store. |
+| `NonceKey` | 32 or more bytes shared by every replica. Turns on server nonces: a proof without a current one is refused with `dpop_nonce`, the middleware answers with a `DPoP-Nonce` header and `WWW-Authenticate: DPoP error="use_dpop_nonce"`. |
+| `RootPins` | Hex SHA-256 of the root public keys a chain may end at, replacing the default (`authfi.DefaultRootPin`). For a private region. |
+
+The resource server:
+
+```go
+auth := authfi.New(authfi.Config{
+    Issuer:    "https://acme.authfi.io",
+    Audience:  []string{"orders-api-client-id"},
+    PublicURL: "https://api.acme.com",
+})
+http.Handle("/orders", auth.Require("read:orders")(ordersHandler))
+```
+
+An agent built with the `agent` package calls it. `WithDPoP` binds the agent's token to a key made for this, and `DPoPTransport` sends `Authorization: DPoP` and a fresh proof with every request (a server nonce the API asks for is echoed once):
+
+```go
+dpopKey, _ := agent.GenerateKey(agent.ES256, "")
+a, _ := agent.New("https://acme.authfi.io", "agt_...", key,
+    agent.WithResource("orders-api-client-id"), agent.WithDPoP(dpopKey))
+rt, _ := a.DPoPTransport(nil, "https://api.acme.com")
+resp, err := (&http.Client{Transport: rt}).Get("https://api.acme.com/orders")
+```
+
+The refusal codes are `dpop_missing`, `dpop_multiple`, `dpop_malformed`, `dpop_type`, `dpop_alg`, `dpop_signature`, `dpop_method`, `dpop_url`, `dpop_iat`, `dpop_ath`, `dpop_replayed`, `dpop_key_mismatch`, `dpop_nonce`, `dpop_replay_unavailable`, `chain_not_proven`, `chain_policy`, `chain_pin` and `agent_token_needs_request`. None carries anything from the token or the proof.
 
 ## Secrets
 

@@ -31,6 +31,29 @@ const (
 	CodeIssuedAtRequired   = "token_iat_required"
 )
 
+// Refusals of the resource-side checks on an agent token and its DPoP proof (RFC 9449).
+const (
+	CodeDPoPMissing           = "dpop_missing"
+	CodeDPoPMultiple          = "dpop_multiple"
+	CodeDPoPMalformed         = "dpop_malformed"
+	CodeDPoPType              = "dpop_type"
+	CodeDPoPAlg               = "dpop_alg"
+	CodeDPoPSignature         = "dpop_signature"
+	CodeDPoPMethod            = "dpop_method"
+	CodeDPoPURL               = "dpop_url"
+	CodeDPoPIssuedAt          = "dpop_iat"
+	CodeDPoPAccessTokenHash   = "dpop_ath"
+	CodeDPoPReplayed          = "dpop_replayed"
+	CodeDPoPKeyMismatch       = "dpop_key_mismatch"
+	CodeDPoPNonce             = "dpop_nonce"
+	CodeDPoPReplayUnavailable = "dpop_replay_unavailable"
+	CodeDPoPReplayGuardFull   = "dpop_replay_guard_full"
+	CodeChainNotProven        = "chain_not_proven"
+	CodeChainPolicy           = "chain_policy"
+	CodeChainPin              = "chain_pin"
+	CodeAgentNeedsRequest     = "agent_token_needs_request"
+)
+
 // Error is a refusal or failure with a stable Code. Use errors.As to read it. Its text never
 // contains a token, a signature or a secret.
 type Error struct {
@@ -40,6 +63,8 @@ type Error struct {
 	// Ref is the reference of the decision behind the refusal: for token_revoked, the jti of the
 	// Security Event Token that withdrew the subject. Empty when there is none.
 	Ref string
+	// Nonce is a fresh DPoP server nonce to send back when Code is CodeDPoPNonce.
+	Nonce string
 }
 
 func (e *Error) Error() string {

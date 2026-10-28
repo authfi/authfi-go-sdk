@@ -35,6 +35,8 @@ const (
 type verifyKey struct {
 	pub  any // *rsa.PublicKey, *ecdsa.PublicKey or ed25519.PublicKey
 	algs []string
+	x5c  []string // base64 DER certificates, leaf first, as published
+	x5t  string   // x5t#S256 as published
 }
 
 func (k verifyKey) allows(alg string) bool {
@@ -232,6 +234,9 @@ type jwk struct {
 	E   string `json:"e"`
 	X   string `json:"x"`
 	Y   string `json:"y"`
+
+	X5c []string `json:"x5c"`
+	X5t string   `json:"x5t#S256"`
 }
 
 func parseKeySet(body []byte) (map[string]verifyKey, error) {
@@ -250,6 +255,7 @@ func parseKeySet(body []byte) (map[string]verifyKey, error) {
 			continue
 		}
 		if vk, ok := k.verifyKey(); ok {
+			vk.x5c, vk.x5t = boundedX5c(k.X5c), k.X5t
 			out[k.Kid] = vk // a key that does not parse is skipped, never fatal to the others
 		}
 	}
@@ -319,3 +325,32 @@ func checkIssuerURL(issuer string) error {
 }
 
 func trimIssuer(s string) string { return strings.TrimRight(strings.TrimSpace(s), "/") }
+
+const (
+	maxX5cCerts    = 6
+	maxX5cCertSize = 16 << 10
+)
+
+// boundedX5c keeps a certificate list the chain check can afford to parse. An oversize list is
+// dropped whole, so a key that publishes one has no chain and is refused where a chain is required.
+func boundedX5c(x5c []string) []string {
+	if len(x5c) > maxX5cCerts {
+		return nil
+	}
+	for _, c := range x5c {
+		if len(c) > maxX5cCertSize {
+			return nil
+		}
+	}
+	return x5c
+}
+
+// sameHostRedirect lets a redirect stay on the issuer's host and scheme and refuses any other, so a
+// key set cannot be read from somewhere the issuer did not name. The redirect answer is then the
+// response, which is not a key set.
+func sameHostRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 3 || req.URL.Host != via[0].URL.Host || req.URL.Scheme != via[0].URL.Scheme {
+		return http.ErrUseLastResponse
+	}
+	return nil
+}

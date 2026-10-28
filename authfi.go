@@ -27,7 +27,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 )
@@ -52,10 +51,33 @@ type Config struct {
 	// actor) was revoked after the token was issued. Feed it with a Receiver (NewReceiver) or
 	// with Revoke. Without it no revocation is checked.
 	Revocations *RevocationStore
-	// HTTPClient fetches the key set of the issuer. Default: a client with a 10 s timeout.
+	// HTTPClient fetches the key set of the issuer. Default: a client with a 10 s timeout that does
+	// not follow a redirect to another host or scheme.
 	HTTPClient *http.Client
 	// Logger receives refusal codes (never a token). Default: no logging.
 	Logger *slog.Logger
+
+	// AgentTokens says what is checked on an agent token (sub or client_id starting agt_, or an act
+	// claim): AgentEnforce (the zero value) requires a DPoP proof for the key in cnf.jkt and a
+	// custody chain from the signing key to AuthFI's pinned root; AgentWatch accepts and logs;
+	// AgentOff skips both, and must be set explicitly.
+	AgentTokens AgentTokenMode
+	// PublicURL is the URL clients call this API at, without the path, for example
+	// https://api.acme.com. A DPoP proof names it in htu. Without it and without TrustForwarded
+	// the request's own Host and TLS state are used.
+	PublicURL string
+	// TrustForwarded makes the proof's URL come from X-Forwarded-Host and X-Forwarded-Proto. Set it
+	// only behind a proxy that overwrites both; anyone can send them otherwise.
+	TrustForwarded bool
+	// ReplayGuard records the proofs seen. Default: a bounded store in this process, correct for
+	// one replica only. With several replicas, share one store.
+	ReplayGuard ReplayGuard
+	// NonceKey, at least 32 bytes shared by every replica, makes the server require a current
+	// DPoP nonce in every proof and answer a refusal with a fresh DPoP-Nonce header.
+	NonceKey []byte
+	// RootPins are the SHA-256 hashes, in hex, of the SubjectPublicKeyInfo of the root CAs a
+	// signing key's chain may end at. Default: AuthFI Root CA R1 (DefaultRootPin).
+	RootPins []string
 
 	Tenant        string
 	APIKey        string // Deprecated: AuthFI does not issue API keys. Used only by Sync.
@@ -77,6 +99,10 @@ type Client struct {
 	mu           sync.Mutex
 	keys         *keySet
 	clock        func() time.Time // tests only
+	replay       ReplayGuard
+	nonces       *hmacNonces
+	chain        *chainVerifier
+	watch        *watchLog
 }
 
 type Claims struct {
@@ -115,7 +141,7 @@ func New(cfg Config) *Client {
 		cfg.JWKSRefresh = 5 * time.Minute
 	}
 	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = &http.Client{Timeout: jwksFetchTimeout}
+		cfg.HTTPClient = &http.Client{Timeout: jwksFetchTimeout, CheckRedirect: sameHostRedirect}
 	}
 	c := &Client{
 		cfg: cfg, clientSecret: NewSecret(cfg.ClientSecret), apiKey: NewSecret(cfg.APIKey),
@@ -127,6 +153,7 @@ func New(cfg Config) *Client {
 	}
 	c.cfg.ClientSecret, c.cfg.APIKey = "", ""
 	c.cfgErr = checkConfig(c.cfg)
+	c.initAgentChecks()
 	c.keys = &keySet{
 		url:     trimIssuer(cfg.Issuer) + jwksPath,
 		ttl:     cfg.JWKSRefresh,
@@ -135,6 +162,22 @@ func New(cfg Config) *Client {
 		now:     c.now,
 	}
 	return c
+}
+
+// initAgentChecks builds what the agent-token checks use. A configuration that cannot (checkConfig
+// reports it) leaves them unset and verification refuses before it would use them.
+func (c *Client) initAgentChecks() {
+	c.watch = &watchLog{seen: map[string]time.Time{}}
+	c.replay = c.cfg.ReplayGuard
+	if c.replay == nil {
+		c.replay = newMemoryReplayGuard(c.now)
+	}
+	if len(c.cfg.NonceKey) >= minNonceKeyLen {
+		c.nonces = newHMACNonces(c.cfg.NonceKey)
+	}
+	if pins, err := parsePins(c.cfg.RootPins); err == nil {
+		c.chain = newChainVerifier(pins)
+	}
 }
 
 // Validate returns why this Client cannot verify tokens, or nil.
@@ -400,11 +443,7 @@ func (c *Client) Format(f fmt.State, _ rune)   { _, _ = io.WriteString(f, c.Stri
 func (c *Client) MarshalJSON() ([]byte, error) { return c.cfg.MarshalJSON() }
 
 func (c *Client) authenticate(r *http.Request) (*Claims, error) {
-	scheme, token, ok := strings.Cut(strings.TrimSpace(r.Header.Get("Authorization")), " ")
-	if !ok || !strings.EqualFold(scheme, "Bearer") || strings.TrimSpace(token) == "" {
-		return nil, refuse(CodeMissingBearer, "send the access token as Authorization: Bearer <token>")
-	}
-	return c.Verify(r.Context(), strings.TrimSpace(token))
+	return c.VerifyRequest(r)
 }
 
 // writeAuthError answers 401, or 503 when verification cannot run, with a JSON body holding only
@@ -418,8 +457,17 @@ func writeAuthError(w http.ResponseWriter, err error) {
 			status = http.StatusServiceUnavailable
 		}
 	}
+	if code == CodeDPoPReplayGuardFull {
+		status = http.StatusTooManyRequests
+	}
+	if code == CodeDPoPReplayUnavailable {
+		status = http.StatusServiceUnavailable
+	}
 	if status == http.StatusUnauthorized {
-		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+		w.Header().Set("WWW-Authenticate", challenge(code))
+	}
+	if e != nil && e.Nonce != "" {
+		w.Header().Set(headerDPoPNonce, e.Nonce)
 	}
 	writeJSON(w, status, map[string]string{"error": code})
 }

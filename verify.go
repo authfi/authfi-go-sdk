@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math/big"
+	"net/http"
 	"strings"
 	"time"
 )
@@ -53,7 +54,7 @@ func checkConfig(cfg Config) error {
 	if cfg.Leeway > maxLeeway {
 		return refuse(CodeNotConfigured, "Leeway is at most %s", maxLeeway)
 	}
-	return nil
+	return checkAgentConfig(cfg)
 }
 
 func (c *Client) leeway() time.Duration {
@@ -80,27 +81,36 @@ func (c *Client) VerifyToken(token string) (*Claims, error) {
 //   - typ is at+jwt, which refuses an ID token, a transaction token and an event as a bearer;
 //   - iss equals Issuer, aud includes one of Audience, exp is present and in the future;
 //   - sub and tenant_id are present, and tenant_id equals TenantID when that is set;
-//   - a token bound to a key (cnf, authfi_mandate) or carrying an act chain is refused.
+//   - a delegation chain (an act inside an act) is refused;
+//   - a token bound to a key (cnf, authfi_mandate) and an agent token (agt_ subject or client, or an
+//     act claim) are refused here, since a proof needs the request: use VerifyRequest or Require.
+//     The refusal of an agent token is CodeAgentNeedsRequest, unless Config.AgentTokens is off.
 //
 // The error is an *Error whose Code names the rule; its text holds nothing from the token.
 func (c *Client) Verify(ctx context.Context, token string) (*Claims, error) {
-	claims, err := c.verify(ctx, token)
-	if err != nil && c.cfg.Logger != nil {
-		code, ref := CodeMalformed, ""
-		var e *Error
-		if errors.As(err, &e) {
-			code, ref = e.Code, e.Ref
-		}
-		c.cfg.Logger.Debug("authfi: token refused", "code", code, "ref", ref)
-	}
+	claims, err := c.verifyWith(ctx, token, nil, "")
+	c.logRefusal(err)
 	return claims, err
 }
 
-func (c *Client) verify(ctx context.Context, token string) (*Claims, error) {
+// tokenHeader is the JOSE header of an access token or a Security Event Token.
+type tokenHeader struct {
+	Alg     string          `json:"alg"`
+	Kid     string          `json:"kid"`
+	Typ     string          `json:"typ"`
+	Crit    json.RawMessage `json:"crit"`
+	X5tS256 string          `json:"x5t#S256"`
+}
+
+// verifyWith verifies token. r and scheme are the request it came on and its Authorization scheme,
+// or nil and "" when there is none. Revocation is checked before the binding (DPoP, the key's chain): a
+// withdrawn subject or actor is refused as token_revoked wherever the token is presented, which is the
+// answer a kill switch owes, and the check reads nothing but the claims.
+func (c *Client) verifyWith(ctx context.Context, token string, r *http.Request, scheme string) (*Claims, error) {
 	if c.cfgErr != nil {
 		return nil, c.cfgErr
 	}
-	payload, err := c.verifyCompact(ctx, token, accessTokenTyp)
+	payload, header, key, err := c.verifyCompact(ctx, token, accessTokenTyp)
 	if err != nil {
 		return nil, err
 	}
@@ -115,65 +125,64 @@ func (c *Client) verify(ctx context.Context, token string) (*Claims, error) {
 	if err := c.checkRevoked(claims); err != nil {
 		return nil, err
 	}
+	if err := c.checkBinding(ctx, &w, presented{token: token, header: header, key: key, req: r, scheme: scheme}); err != nil {
+		return nil, err
+	}
 	return claims, nil
 }
 
 // verifyCompact checks the structure and the signature of a compact JWS: size, three parts, an
 // allowed alg, no critical extensions, the media type wantTyp, a kid, and a signature by the
-// issuer's key of that kid that is allowed to use that alg. It returns the decoded payload and
-// reads nothing from it. Access tokens and Security Event Tokens both pass through it, so the two
-// cannot drift apart on what a valid signature is.
-func (c *Client) verifyCompact(ctx context.Context, token, wantTyp string) ([]byte, error) {
+// issuer's key of that kid that is allowed to use that alg. It returns the decoded payload, the header
+// and the key, and reads nothing from the payload. Access tokens and Security Event Tokens both pass
+// through it, so the two cannot drift apart on what a valid signature is.
+func (c *Client) verifyCompact(ctx context.Context, token, wantTyp string) ([]byte, tokenHeader, verifyKey, error) {
+	var header tokenHeader
+	var none verifyKey
 	if len(token) > maxTokenBytes {
-		return nil, refuse(CodeTooLarge, "the token is larger than %d bytes", maxTokenBytes)
+		return nil, header, none, refuse(CodeTooLarge, "the token is larger than %d bytes", maxTokenBytes)
 	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return nil, refuse(CodeMalformed, "a token is three dot-separated parts")
-	}
-	var header struct {
-		Alg  string          `json:"alg"`
-		Kid  string          `json:"kid"`
-		Typ  string          `json:"typ"`
-		Crit json.RawMessage `json:"crit"`
+		return nil, header, none, refuse(CodeMalformed, "a token is three dot-separated parts")
 	}
 	if err := decodeSegment(parts[0], &header); err != nil {
-		return nil, refuse(CodeMalformed, "the token header is not valid")
+		return nil, header, none, refuse(CodeMalformed, "the token header is not valid")
 	}
 	switch header.Alg {
 	case "RS256", "PS256", "ES256", "EdDSA":
 	default:
-		return nil, refuse(CodeAlgNotAllowed, "the algorithm of the token is not accepted")
+		return nil, header, none, refuse(CodeAlgNotAllowed, "the algorithm of the token is not accepted")
 	}
 	if present(header.Crit) {
-		return nil, refuse(CodeCritNotSupported, "the token carries critical header extensions this SDK does not understand")
+		return nil, header, none, refuse(CodeCritNotSupported, "the token carries critical header extensions this SDK does not understand")
 	}
 	if typ := strings.TrimPrefix(strings.ToLower(header.Typ), "application/"); typ != wantTyp {
-		return nil, refuse(CodeTypInvalid, "the token is not of the expected type (typ must be %s)", wantTyp)
+		return nil, header, none, refuse(CodeTypInvalid, "the token is not of the expected type (typ must be %s)", wantTyp)
 	}
 	if header.Kid == "" {
-		return nil, refuse(CodeKeyIDRequired, "the token names no signing key")
+		return nil, header, none, refuse(CodeKeyIDRequired, "the token names no signing key")
 	}
 	sig, err := decodeB64(parts[2])
 	if err != nil || len(sig) == 0 {
-		return nil, refuse(CodeMalformed, "the token signature is not valid")
+		return nil, header, none, refuse(CodeMalformed, "the token signature is not valid")
 	}
 
 	key, err := c.keys.get(ctx, header.Kid)
 	if err != nil {
-		return nil, err
+		return nil, header, none, err
 	}
 	if !key.allows(header.Alg) {
-		return nil, refuse(CodeAlgKeyMismatch, "the algorithm of the token does not match its signing key")
+		return nil, header, none, refuse(CodeAlgKeyMismatch, "the algorithm of the token does not match its signing key")
 	}
 	if !verifySignature(header.Alg, key.pub, []byte(parts[0]+"."+parts[1]), sig) {
-		return nil, refuse(CodeSignatureInvalid, "the token signature does not verify")
+		return nil, header, none, refuse(CodeSignatureInvalid, "the token signature does not verify")
 	}
 	payload, err := decodeB64(parts[1])
 	if err != nil {
-		return nil, refuse(CodeMalformed, "the token payload is not valid")
+		return nil, header, none, refuse(CodeMalformed, "the token payload is not valid")
 	}
-	return payload, nil
+	return payload, header, key, nil
 }
 
 func verifySignature(alg string, pub any, signed, sig []byte) bool {
@@ -248,9 +257,6 @@ func (c *Client) checkClaims(w *wireClaims) (*Claims, error) {
 	if c.cfg.TenantID != "" && w.TenantID != c.cfg.TenantID {
 		return nil, refuse(CodeTenantMismatch, "the token belongs to another tenant")
 	}
-	if present(w.Cnf) || present(w.Mandate) {
-		return nil, refuse(CodeDPoPProofRequired, "the token is bound to a key and cannot be used as a bearer")
-	}
 	var actor string
 	if present(w.Act) {
 		var a struct {
@@ -307,6 +313,8 @@ type wireClaims struct {
 	Act      json.RawMessage `json:"act"`
 	Cnf      json.RawMessage `json:"cnf"`
 	Mandate  json.RawMessage `json:"authfi_mandate"`
+	Azp      string          `json:"azp"`
+	AgentID  string          `json:"agent_id"`
 }
 
 type audience []string

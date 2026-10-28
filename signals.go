@@ -184,7 +184,7 @@ type subjectID struct {
 // accept runs every check and, only if all pass, applies the SET. It returns an RFC 8935 error
 // code, or "" for accepted.
 func (r *Receiver) accept(ctx context.Context, token string) (status int, code, desc string) {
-	payload, err := r.c.verifyCompact(ctx, token, setTyp)
+	payload, _, _, err := r.c.verifyCompact(ctx, token, setTyp)
 	if err != nil {
 		return verifyFailure(err)
 	}

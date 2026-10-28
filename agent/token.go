@@ -129,8 +129,8 @@ func parseToken(status int, body []byte, now time.Time, secrets ...string) (Toke
 	if err := json.Unmarshal(body, &r); err != nil || r.AccessToken == "" {
 		return Token{}, &TokenError{Code: "invalid_response", Description: "the token endpoint answered no access_token", Status: status}
 	}
-	if t := strings.ToLower(r.TokenType); t != "" && t != "bearer" {
-		return Token{}, &TokenError{Code: "invalid_response", Description: "the token endpoint answered a token type other than Bearer", Status: status}
+	if t := strings.ToLower(r.TokenType); t != "" && t != "bearer" && t != "dpop" {
+		return Token{}, &TokenError{Code: "invalid_response", Description: "the token endpoint answered a token type other than Bearer or DPoP", Status: status}
 	}
 	if r.ExpiresIn <= 0 {
 		return Token{}, &TokenError{Code: "invalid_response", Description: "the token endpoint answered no lifetime", Status: status}

@@ -37,7 +37,7 @@ func TestVerifyAcceptsEveryAlgorithm(t *testing.T) {
 // An agent token is EdDSA, carries client_id and scope, and a delegated one an act claim.
 func TestVerifyAgentAndDelegatedTokens(t *testing.T) {
 	f := newFixture(t)
-	c := f.client()
+	c := f.client(func(cfg *Config) { cfg.AgentTokens = AgentOff })
 	agent := f.mint(tokenSpec{kid: "ed1", claims: map[string]any{"sub": "agt_1", "client_id": "agt_1", "scope": "tools.read"}})
 	got, err := c.VerifyToken(agent)
 	if err != nil || got.ClientID != "agt_1" || got.Scope != "tools.read" || got.Actor != "" {
