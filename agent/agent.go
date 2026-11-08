@@ -43,6 +43,10 @@ type Agent struct {
 	log      *slog.Logger
 	dpop     *Key // WithDPoP: the key token requests are proved with, and tokens are bound to
 
+	inst        *instance // set by NewInstance: the agent signs in by attestation and holds no key
+	imageDigest string    // WithImageDigest, for an instance
+	apiOrigin   string    // WithAPIOrigin, for an instance
+
 	nonceMu    sync.Mutex
 	tokenNonce string // the latest DPoP nonce the token endpoint sent
 
@@ -97,6 +101,20 @@ func WithLogger(l *slog.Logger) Option { return func(a *Agent) { a.log = l } }
 // example https://acme.authfi.io: there is no platform default, because an agent signs for the
 // issuer it is given. Nothing is fetched until the first call.
 func New(issuer, agentID string, key *Key, opts ...Option) (*Agent, error) {
+	if key == nil {
+		return nil, errors.New("agent: the key is required")
+	}
+	a, err := newAgent(issuer, agentID, opts...)
+	if err != nil {
+		return nil, err
+	}
+	a.key = key
+	return a, nil
+}
+
+// newAgent is what a key-file agent and an instance share: the checks of the issuer and the id,
+// the HTTP client that never follows a redirect, and the options.
+func newAgent(issuer, agentID string, opts ...Option) (*Agent, error) {
 	issuer = strings.TrimRight(strings.TrimSpace(issuer), "/")
 	if err := checkOrigin(issuer); err != nil {
 		return nil, fmt.Errorf("agent: issuer: %w", err)
@@ -104,11 +122,8 @@ func New(issuer, agentID string, key *Key, opts ...Option) (*Agent, error) {
 	if strings.TrimSpace(agentID) == "" {
 		return nil, errors.New("agent: the agent id is required")
 	}
-	if key == nil {
-		return nil, errors.New("agent: the key is required")
-	}
 	a := &Agent{
-		issuer: issuer, id: agentID, key: key,
+		issuer: issuer, id: agentID,
 		http:    &http.Client{Timeout: 30 * time.Second},
 		now:     time.Now,
 		sleep:   sleepCtx,
@@ -303,6 +318,9 @@ func (a *Agent) postForm(ctx context.Context, endpoint string, form url.Values) 
 
 // authForm is a form with the agent's client authentication in it: a fresh assertion for audience.
 func (a *Agent) authForm(audience string, fields url.Values) (url.Values, authfi.Secret, error) {
+	if a.inst != nil {
+		return nil, authfi.Secret{}, errInstanceNoAssertion
+	}
 	as, err := clientAssertion(a.key, a.id, audience, a.now())
 	if err != nil {
 		return nil, authfi.Secret{}, err
@@ -336,6 +354,9 @@ func (a *Agent) Token(ctx context.Context) (Token, error) {
 	}
 	tok, err := a.mint(ctx)
 	if err != nil {
+		if held, ok := a.stillValid(err); ok {
+			return held, nil
+		}
 		a.logRefusal("client_credentials", err)
 		return Token{}, err
 	}
@@ -350,10 +371,44 @@ func (a *Agent) Token(ctx context.Context) (Token, error) {
 	return tok, nil
 }
 
+// graceRetry is how long a still-valid token is used after the platform could not be reached for a
+// renewal, before the next call tries again.
+const graceRetry = 10 * time.Second
+
+// stillValid answers a failed renewal with the cached token when the platform merely could not be
+// reached (no connection, or a 5xx) or the evidence for a new attestation cannot be remade yet (a
+// Kubernetes token not yet rotated) and the token has not expired. A refusal (invalid_client, a
+// refused attestation, a revoked agent) is never softened: the caller learns of it at once.
+func (a *Agent) stillValid(err error) (Token, bool) {
+	var te *TokenError
+	if a.cached.secret.IsEmpty() || !a.now().Before(a.cached.Expiry) || !errors.As(err, &te) {
+		return Token{}, false
+	}
+	if te.Code != "unreachable" && te.Code != codeEvidenceNotRotated && te.Status < 500 {
+		return Token{}, false
+	}
+	a.renewAt = a.now().Add(graceRetry)
+	if a.renewAt.After(a.cached.Expiry) {
+		a.renewAt = a.cached.Expiry
+	}
+	if a.log != nil {
+		a.log.Warn("agent: renewal failed, using the token until it expires", "agent", a.id,
+			"code", te.Code, "status", te.Status, "expires", a.cached.Expiry.UTC().Format(time.RFC3339))
+	}
+	return a.cached, true
+}
+
 func (a *Agent) mint(ctx context.Context) (Token, error) {
 	ep, err := a.endpoints(ctx)
 	if err != nil {
 		return Token{}, &TokenError{Code: "discovery_failed", Description: authfi.Scrub(err.Error()), Err: err}
+	}
+	if a.inst != nil {
+		// The attestation is asked for once, outside the retry loop: its evidence works once, so a
+		// failed attest is the caller's to retry, with new evidence.
+		if _, err := a.attested(ctx); err != nil {
+			return Token{}, err
+		}
 	}
 	var last error
 	for attempt := 0; attempt < mintAttempts; attempt++ {
@@ -387,7 +442,7 @@ func (a *Agent) mint(ctx context.Context) (Token, error) {
 // DPoP key, and when the endpoint answers that it wants a nonce it is sent once more with it.
 func (a *Agent) postToken(ctx context.Context, endpoint string, fields url.Values) (reply, authfi.Secret, error) {
 	r, assertion, err := a.postTokenOnce(ctx, endpoint, fields)
-	if err == nil && a.dpop != nil && r.nonce != "" {
+	if err == nil && a.dpopBound() && r.nonce != "" {
 		a.setNonce(r.nonce)
 		if r.status == http.StatusBadRequest || r.status == http.StatusUnauthorized {
 			return a.postTokenOnce(ctx, endpoint, fields)
@@ -397,6 +452,10 @@ func (a *Agent) postToken(ctx context.Context, endpoint string, fields url.Value
 }
 
 func (a *Agent) postTokenOnce(ctx context.Context, endpoint string, fields url.Values) (reply, authfi.Secret, error) {
+	if a.inst != nil {
+		r, err := a.postInstanceToken(ctx, endpoint, fields)
+		return r, authfi.Secret{}, err
+	}
 	form, assertion, err := a.authForm(endpoint, fields)
 	if err != nil {
 		return reply{}, authfi.Secret{}, err
@@ -448,6 +507,9 @@ func (s tokenSource) Token() (*oauth2.Token, error) {
 }
 
 func (a *Agent) String() string {
+	if a.inst != nil {
+		return fmt.Sprintf("agent.Agent(issuer=%s, id=%s, instance=%s)", a.issuer, a.id, a.inst.evidence.Kind())
+	}
 	return fmt.Sprintf("agent.Agent(issuer=%s, id=%s, key=%s)", a.issuer, a.id, a.key)
 }
 func (a *Agent) GoString() string           { return a.String() }

@@ -100,8 +100,12 @@ func DPoPTransport(src oauth2.TokenSource, key *Key, base http.RoundTripper, sen
 // DPoPTransport is the agent's transport for a resource that requires DPoP: its token, bound by
 // WithDPoP, sent with a proof per request.
 func (a *Agent) DPoPTransport(base http.RoundTripper, sendTo ...string) (http.RoundTripper, error) {
-	if a.dpop == nil {
+	key, err := a.dpopKey()
+	if err != nil {
+		return nil, err
+	}
+	if key == nil {
 		return nil, errors.New("agent: WithDPoP is required to use DPoPTransport")
 	}
-	return DPoPTransport(a.TokenSource(), a.dpop, base, sendTo...)
+	return DPoPTransport(a.TokenSource(), key, base, sendTo...)
 }

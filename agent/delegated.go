@@ -58,6 +58,9 @@ func (r *CIBARequest) MarshalJSON() ([]byte, error) {
 //
 // The request creates state at the platform, so it is never sent twice.
 func (a *Agent) RequestUserApproval(ctx context.Context, loginHint, bindingMessage string, scope []string, expiry time.Duration) (*CIBARequest, error) {
+	if a.inst != nil {
+		return nil, errInstanceNoAssertion
+	}
 	if strings.TrimSpace(loginHint) == "" {
 		return nil, errors.New("agent: loginHint is required: the platform must know which person to ask")
 	}
@@ -139,6 +142,9 @@ func (a *Agent) RequestUserApproval(ctx context.Context, loginHint, bindingMessa
 //
 // The token is never renewed: the approval was for it. After expiry, Token returns expired_token.
 func (a *Agent) AwaitUserToken(ctx context.Context, req *CIBARequest) (*DelegatedToken, error) {
+	if a.inst != nil {
+		return nil, errInstanceNoAssertion
+	}
 	if req == nil || req.authReqID.IsEmpty() {
 		return nil, errors.New("agent: a CIBARequest from RequestUserApproval is required")
 	}
@@ -198,6 +204,9 @@ func (a *Agent) AwaitUserToken(ctx context.Context, req *CIBARequest) (*Delegate
 // The exchange creates state at the platform, so it is never sent twice. The result is renewed by
 // exchanging again for as long as subject stays valid.
 func (a *Agent) Exchange(ctx context.Context, subject authfi.Secret, scope []string, resource string) (*DelegatedToken, error) {
+	if a.inst != nil {
+		return nil, errInstanceNoAssertion
+	}
 	if subject.IsEmpty() {
 		return nil, errors.New("agent: the person's token is required")
 	}
