@@ -286,7 +286,7 @@ func TestKubernetesTokenThatHasNotRotatedIsNotPresentedTwice(t *testing.T) {
 	mustToken(t, a)
 	p.advance(250 * time.Second) // the attestation is due again, the kubelet has not rotated the file
 	te := tokenErr(t, a)
-	if te.Code != "evidence_unavailable" || !strings.Contains(te.Description, "has not rotated") {
+	if te.Code != "evidence_not_rotated" || !strings.Contains(te.Description, "has not rotated") {
 		t.Fatalf("%+v", te)
 	}
 	if p.count("POST "+attestPath) != 1 {

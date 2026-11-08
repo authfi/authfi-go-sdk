@@ -65,7 +65,7 @@ func bindingMessage(nonce, agentID, instanceKeyJkt string) []byte {
 // errEvidenceNotRotated marks evidence that cannot be remade yet because the kubelet has not rotated
 // the file. It is not a refusal by the platform: nothing was decided, so a still-valid token may be
 // used meanwhile.
-var errEvidenceNotRotated = errors.New("agent: evidence not rotated")
+var errEvidenceNotRotated = errors.New("evidence not rotated")
 
 type kubernetesEvidence struct {
 	path string
@@ -120,9 +120,9 @@ func (k *kubernetesEvidence) evidence(_ context.Context, in evidenceInput) (stri
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if token == k.last {
-		return "", fmt.Errorf("%w: the service-account token in %s has not rotated since the last sign-in tried it, and it "+
+		return "", fmt.Errorf("agent: the service-account token in %s has not rotated since the last sign-in tried it, and it "+
 			"works once (a sign-in that failed after sending it may have spent it): project it with expirationSeconds: 600 "+
-			"so the kubelet renews it every 8 minutes", errEvidenceNotRotated, k.path)
+			"so the kubelet renews it every 8 minutes: %w", k.path, errEvidenceNotRotated)
 	}
 	k.last = token
 	return token, nil
