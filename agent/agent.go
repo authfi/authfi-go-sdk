@@ -376,14 +376,15 @@ func (a *Agent) Token(ctx context.Context) (Token, error) {
 const graceRetry = 10 * time.Second
 
 // stillValid answers a failed renewal with the cached token when the platform merely could not be
-// reached (no connection, or a 5xx) and the token has not expired. A refusal (invalid_client, a
+// reached (no connection, or a 5xx) or the evidence for a new attestation cannot be remade yet (a
+// Kubernetes token not yet rotated) and the token has not expired. A refusal (invalid_client, a
 // refused attestation, a revoked agent) is never softened: the caller learns of it at once.
 func (a *Agent) stillValid(err error) (Token, bool) {
 	var te *TokenError
 	if a.cached.secret.IsEmpty() || !a.now().Before(a.cached.Expiry) || !errors.As(err, &te) {
 		return Token{}, false
 	}
-	if te.Code != "unreachable" && te.Status < 500 {
+	if te.Code != "unreachable" && te.Code != codeEvidenceNotRotated && te.Status < 500 {
 		return Token{}, false
 	}
 	a.renewAt = a.now().Add(graceRetry)

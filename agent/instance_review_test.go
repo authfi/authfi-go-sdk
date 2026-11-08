@@ -48,7 +48,7 @@ func TestKubernetesTokenIsCountedUsedWhenTheAttestFailsAfterSending(t *testing.T
 	}
 	p.script(func() { p.extraAttest = nil })
 	te := tokenErr(t, a)
-	if te.Code != "evidence_unavailable" || !strings.Contains(te.Description, "may have spent it") {
+	if te.Code != "evidence_not_rotated" || !strings.Contains(te.Description, "may have spent it") {
 		t.Fatalf("%+v", te)
 	}
 	rewriteToken(t, p, path, "rotated")
@@ -251,5 +251,87 @@ func TestADeviceKeyWinsOverAKubernetesTokenWhenBothArePresent(t *testing.T) {
 	}
 	if a.inst.evidence.Kind() != kindDevice {
 		t.Fatalf("evidence kind %s", a.inst.evidence.Kind())
+	}
+}
+
+// The grace for a still-valid token and the used-once rule for the Kubernetes token work together:
+// an attest that fails after it was sent, in the minute the token is due, must not leave the caller
+// with an error while the old access token is still good.
+func TestAnAttestDroppedInTheRenewalMinuteKeepsTheTokenWhileTheServiceAccountTokenIsNotRotated(t *testing.T) {
+	p := newInstPlatform(t)
+	path := writeToken(t, p, "a")
+	a := p.instanceWith(KubernetesEvidence(path))
+	mustToken(t, a)
+	p.advance(540 * time.Second) // the token is renewed on the held attestation
+	rewriteToken(t, p, path, "b")
+	second := mustToken(t, a)
+	// The attestation (900 s) ends before the second token (600 s) is renewed: both are due together.
+	p.advance(time.Duration(p.tokenTTL-60) * time.Second)
+	rewriteToken(t, p, path, "c")
+	p.script(func() {
+		p.extraAttest = func(w http.ResponseWriter) bool {
+			hj, _ := w.(http.Hijacker)
+			c, _, _ := hj.Hijack()
+			_ = c.Close() // the request arrived; the reply never does
+			return true
+		}
+	})
+	got, err := a.Token(context.Background())
+	if err != nil || got.Reveal() != second.Reveal() {
+		t.Fatalf("the still-valid token is used when the attest cannot be completed: %v", err)
+	}
+	p.script(func() { p.extraAttest = nil })
+	p.advance(graceRetry) // the platform is back; the file has not rotated since "c" was sent
+	got, err = a.Token(context.Background())
+	if err != nil || got.Reveal() != second.Reveal() {
+		t.Fatalf("an unrotated service-account token is a wait, not a failure, while the token is good: %v", err)
+	}
+	rewriteToken(t, p, path, "d") // the kubelet rotates the file
+	p.advance(graceRetry)
+	if renewed := mustToken(t, a); renewed.Reveal() == second.Reveal() {
+		t.Fatal("a renewal that can be made is made")
+	}
+}
+
+// The same wait does not outlive the token, and a refusal in that minute is not softened.
+func TestAnUnrotatedServiceAccountTokenIsNotKeptPastExpiryAndARefusedAttestIsNotSoftened(t *testing.T) {
+	setup := func() (*instPlatform, *Agent, Token, string) {
+		p := newInstPlatform(t)
+		path := writeToken(t, p, "a")
+		a := p.instanceWith(KubernetesEvidence(path))
+		mustToken(t, a)
+		p.advance(540 * time.Second)
+		rewriteToken(t, p, path, "b")
+		second := mustToken(t, a)
+		p.advance(time.Duration(p.tokenTTL-60) * time.Second)
+		rewriteToken(t, p, path, "c")
+		return p, a, second, path
+	}
+
+	p, a, _, _ := setup()
+	p.script(func() {
+		p.extraAttest = func(w http.ResponseWriter) bool {
+			writeJSONTest(w, 401, map[string]string{"error": "unauthorized"})
+			return true
+		}
+	})
+	if te := tokenErr(t, a); te.Status != 401 {
+		t.Fatalf("a refused attest is told at once: %+v", te)
+	}
+
+	p, a, _, _ = setup()
+	p.script(func() {
+		p.extraAttest = func(w http.ResponseWriter) bool {
+			hj, _ := w.(http.Hijacker)
+			c, _, _ := hj.Hijack()
+			_ = c.Close()
+			return true
+		}
+	})
+	mustToken(t, a) // held
+	p.script(func() { p.extraAttest = nil })
+	p.advance(61 * time.Second) // past the token's end
+	if te := tokenErr(t, a); te.Code != "evidence_not_rotated" {
+		t.Fatalf("an expired token is not kept: %+v", te)
 	}
 }

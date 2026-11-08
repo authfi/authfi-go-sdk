@@ -320,7 +320,11 @@ func (a *Agent) attested(ctx context.Context) (*attestation, error) {
 	now := a.now()
 	ev, err := in.evidence.evidence(ctx, evidenceInput{Nonce: nonce, AgentID: a.id, InstanceKeyJkt: jkt, Issuer: a.issuer, Now: now})
 	if err != nil {
-		return nil, &TokenError{Code: "evidence_unavailable", Description: authfi.Scrub(err.Error()), Err: err}
+		code := "evidence_unavailable"
+		if errors.Is(err, errEvidenceNotRotated) {
+			code = codeEvidenceNotRotated
+		}
+		return nil, &TokenError{Code: code, Description: authfi.Scrub(err.Error()), Err: err}
 	}
 	jti, err := randomID()
 	if err != nil {
@@ -393,6 +397,10 @@ func (a *Agent) postJSON(ctx context.Context, endpoint string, body any) (reply,
 	req.Header.Set("Content-Type", "application/json")
 	return a.do(req)
 }
+
+// codeEvidenceNotRotated is the TokenError code for a Kubernetes token the kubelet has not yet
+// replaced. Unlike evidence_unavailable (expired, wrong audience, empty) it is a wait, not a fault.
+const codeEvidenceNotRotated = "evidence_not_rotated"
 
 // What the person reading a refusal can do. The attest route gives every failed sign-in the same 401
 // (it must not say which agents exist, what they are bound to, or which part of the evidence was wrong),
