@@ -141,6 +141,26 @@ The key, every token, every assertion and the CIBA handle print redacted and nev
 
 A refusal is a `*agent.TokenError` with the OAuth `Code` (`invalid_client`, `access_denied`, `expired_token`, ...) and is not retried. A network failure while minting is retried twice with a fresh assertion; a request that creates state (CIBA, exchange) is never sent twice. `LoadKey` checks file modes on Linux and macOS only.
 
+## Agents with no key file: sign in as an instance
+
+An agent bound to a workload holds no secret. Each run (an *instance*) makes a key in memory, shows the platform where it runs, and trades that for a 15-minute attestation and a token bound to its key. The key is made on the first sign-in, never when the agent is built.
+
+```go
+// Kubernetes: a projected service-account token (audience = your project's origin, expirationSeconds: 600)
+ev := agent.KubernetesEvidence("") // default /var/run/secrets/kubernetes.io/serviceaccount/token
+// Device: the key the device was bound with; it signs the nonce, the agent and the instance key, and is never sent
+// ev, _ := agent.DeviceEvidence(deviceKey)
+
+a, err := agent.NewInstance("https://acme.authfi.io", "agt_...", ev,
+	agent.Configuration{Version: 3, Digest: "sha256:..."}) // the approved configuration this run executes
+
+rt, _ := a.DPoPTransport(nil, "https://api.example.com") // Authorization: DPoP and a proof of the instance key per request
+```
+
+Or let the environment say it all: `agent.NewInstanceFromEnv()` reads `AUTHFI_ISSUER`, `AUTHFI_AGENT_ID`, `AUTHFI_DEVICE_KEY_FILE` (else the Kubernetes token file), `AUTHFI_CONFIG_VERSION` and `AUTHFI_CONFIG_DIGEST`, and optionally `AUTHFI_IMAGE_DIGEST`, `AUTHFI_API_ORIGIN` and `AUTHFI_AGENT_RESOURCE`. A new agent a person is observing signs in with `agent.ObserveConfiguration()` (`AUTHFI_CONFIG_OBSERVE=1`); that is never the default.
+
+The attestation and the token are cached, shared by concurrent callers, and renewed lazily on the call path a minute before they end: a warm call makes no request. A sign-in request is never sent twice, because its evidence works once; the platform answers every failed sign-in the same way, so the error says what to check and the reason is on the audit tape (`agent.attest.refused`). Acting for a person (CIBA, token exchange) is not yet available to an instance and returns code `not_supported`.
+
 ## Revocation: stop an agent's tokens the moment AuthFI withdraws it
 
 Access tokens verify offline, so a revoked or suspended agent keeps working until its token expires, unless AuthFI tells you. AuthFI sends a signed Shared Signals event (RFC 8935 push) when an agent is revoked, suspended or deleted. A `Receiver` takes it and your `Client` refuses the agent's earlier tokens at once.
