@@ -281,11 +281,10 @@ func TestKubernetesTokenForAnotherAudienceIsNotSent(t *testing.T) {
 
 func TestKubernetesTokenThatHasNotRotatedIsNotPresentedTwice(t *testing.T) {
 	p := newInstPlatform(t)
-	path := filepath.Join(t.TempDir(), "token")
-	_ = os.WriteFile(path, []byte(p.k8sToken(p.issuer(), 3*time.Hour, "long")), 0o600)
-	a := p.instanceWith(KubernetesEvidence(path))
+	p.attestTTL, p.tokenTTL = 300, 200 // the attestation is due again while the 10-minute service-account token is unexpired
+	a := p.instanceWith(KubernetesEvidence(writeToken(t, p, "same")))
 	mustToken(t, a)
-	p.advance(15 * time.Minute) // the attestation is due again, the kubelet has not rotated the file
+	p.advance(250 * time.Second) // the attestation is due again, the kubelet has not rotated the file
 	te := tokenErr(t, a)
 	if te.Code != "evidence_unavailable" || !strings.Contains(te.Description, "has not rotated") {
 		t.Fatalf("%+v", te)
@@ -362,7 +361,7 @@ func TestAnAttestationThatIsNotThisInstancesIsRefused(t *testing.T) {
 	}
 }
 
-func TestRefusalsKeepEverySecretOutOfTheErrorAndTheLog(t *testing.T) {
+func TestSecretsStayOutOfTheStringsAndTheLogOnTheHappyPath(t *testing.T) {
 	p := newInstPlatform(t)
 	var logs bytes.Buffer
 	a := p.instanceWith(KubernetesEvidence(writeToken(t, p, "a")), WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))

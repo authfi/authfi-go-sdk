@@ -65,16 +65,18 @@ type instPlatform struct {
 	instances map[string]string // attestation jti -> jkt
 
 	// scripts
-	attestStatus  int                              // when set, attest answers this status
-	mutate        func(claims map[string]any)      // changes the attestation before it is signed
-	mutateHeader  func(header map[string]any)      // changes the attestation header
-	tokenStatuses []int                            // statuses the token endpoint answers before succeeding
-	log           []string                         // "METHOD path" of every request, in order
-	attests       []map[string]any                 // every decoded attest body
-	tokenReqs     []tokenReq                       // every token request seen
-	issuedTokens  map[string]string                // access token -> cnf jkt
-	refusals      []string                         // why each refusal happened
-	extraAttest   func(w http.ResponseWriter) bool // answer the attest in a special way
+	attestStatus   int                                               // when set, attest answers this status
+	mutate         func(claims map[string]any)                       // changes the attestation before it is signed
+	mutateHeader   func(header map[string]any)                       // changes the attestation header
+	tokenStatuses  []int                                             // statuses the token endpoint answers before succeeding
+	log            []string                                          // "METHOD path" of every request, in order
+	attests        []map[string]any                                  // every decoded attest body
+	tokenReqs      []tokenReq                                        // every token request seen
+	issuedTokens   map[string]string                                 // access token -> cnf jkt
+	refusals       []string                                          // why each refusal happened
+	extraAttest    func(w http.ResponseWriter) bool                  // answer the attest in a special way
+	extraChallenge func(w http.ResponseWriter) bool                  // answer the challenge in a special way
+	extraToken     func(w http.ResponseWriter, r *http.Request) bool // answer the token request in a special way
 }
 
 type tokenReq struct {
@@ -91,6 +93,13 @@ func newInstPlatform(t *testing.T) *instPlatform {
 	p.srv = httptest.NewServer(http.HandlerFunc(p.serve))
 	t.Cleanup(p.srv.Close)
 	return p
+}
+
+// script changes the fake's scripted behaviour while the server may be handling a request.
+func (p *instPlatform) script(f func()) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	f()
 }
 
 func (p *instPlatform) issuer() string { return p.srv.URL }
@@ -170,6 +179,9 @@ func (p *instPlatform) serve(w http.ResponseWriter, r *http.Request) {
 	case "/.well-known/agent-configuration":
 		http.NotFound(w, r)
 	case challengePath:
+		if p.extraChallenge != nil && p.extraChallenge(w) {
+			return
+		}
 		p.seq++
 		n := fmt.Sprintf("nonce-%d-%s", p.seq, randomHex(6))
 		p.nonces[n] = false
@@ -333,6 +345,9 @@ func (p *instPlatform) checkDevice(tok, nonce, agent, jkt string) bool {
 func (p *instPlatform) token(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
 	p.tokenReqs = append(p.tokenReqs, tokenReq{form: r.PostForm, header: r.Header.Clone()})
+	if p.extraToken != nil && p.extraToken(w, r) {
+		return
+	}
 	if len(p.tokenStatuses) > 0 {
 		st := p.tokenStatuses[0]
 		p.tokenStatuses = p.tokenStatuses[1:]

@@ -354,6 +354,9 @@ func (a *Agent) Token(ctx context.Context) (Token, error) {
 	}
 	tok, err := a.mint(ctx)
 	if err != nil {
+		if held, ok := a.stillValid(err); ok {
+			return held, nil
+		}
 		a.logRefusal("client_credentials", err)
 		return Token{}, err
 	}
@@ -366,6 +369,32 @@ func (a *Agent) Token(ctx context.Context) (Token, error) {
 		a.log.Info("agent: token minted", "agent", a.id, "expires", tok.Expiry.UTC().Format(time.RFC3339))
 	}
 	return tok, nil
+}
+
+// graceRetry is how long a still-valid token is used after the platform could not be reached for a
+// renewal, before the next call tries again.
+const graceRetry = 10 * time.Second
+
+// stillValid answers a failed renewal with the cached token when the platform merely could not be
+// reached (no connection, or a 5xx) and the token has not expired. A refusal (invalid_client, a
+// refused attestation, a revoked agent) is never softened: the caller learns of it at once.
+func (a *Agent) stillValid(err error) (Token, bool) {
+	var te *TokenError
+	if a.cached.secret.IsEmpty() || !a.now().Before(a.cached.Expiry) || !errors.As(err, &te) {
+		return Token{}, false
+	}
+	if te.Code != "unreachable" && te.Status < 500 {
+		return Token{}, false
+	}
+	a.renewAt = a.now().Add(graceRetry)
+	if a.renewAt.After(a.cached.Expiry) {
+		a.renewAt = a.cached.Expiry
+	}
+	if a.log != nil {
+		a.log.Warn("agent: renewal failed, using the token until it expires", "agent", a.id,
+			"code", te.Code, "status", te.Status, "expires", a.cached.Expiry.UTC().Format(time.RFC3339))
+	}
+	return a.cached, true
 }
 
 func (a *Agent) mint(ctx context.Context) (Token, error) {

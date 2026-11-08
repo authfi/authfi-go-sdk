@@ -47,6 +47,9 @@ const (
 	kindDevice     = "device"
 
 	maxEvidenceFile = 16 << 10
+
+	// maxKubernetesTokenLifetime is the longest service-account token the platform accepts, in seconds.
+	maxKubernetesTokenLifetime = 600
 )
 
 // bindingMessage is the exact bytes a device key signs: the server nonce, the agent the instance
@@ -69,7 +72,9 @@ type kubernetesEvidence struct {
 // KubernetesEvidence is the pod's projected service-account token, read from path at the time of each
 // sign-in (empty path means KubernetesTokenPath). Project it with audience set to the project's
 // origin and expirationSeconds: 600, so the kubelet renews it before the next attestation is due.
-// The token works once; the SDK refuses to present the same one twice.
+// The token works once; the SDK refuses to present the same one twice. A token counts as used when
+// it is handed to the sign-in, so a connection that fails after the send leaves the sign-in
+// blocked until the kubelet rotates the file (up to about 8 minutes): the platform may have seen it.
 func KubernetesEvidence(path string) Evidence {
 	if strings.TrimSpace(path) == "" {
 		path = KubernetesTokenPath
@@ -100,11 +105,19 @@ func (k *kubernetesEvidence) evidence(_ context.Context, in evidenceInput) (stri
 		return "", fmt.Errorf("agent: the service-account token in %s has expired: project it with expirationSeconds 600 "+
 			"so the kubelet renews it", k.path)
 	}
+	// The platform refuses a token that lives longer than 600 seconds (token_lifetime_too_long).
+	if iat, ok := claims["iat"].(float64); ok {
+		if exp, ok := claims["exp"].(float64); ok && exp-iat > maxKubernetesTokenLifetime {
+			return "", fmt.Errorf("agent: the service-account token in %s lives %d seconds and the platform accepts at most %d: "+
+				"project it with expirationSeconds: 600", k.path, int64(exp-iat), maxKubernetesTokenLifetime)
+		}
+	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if token == k.last {
-		return "", fmt.Errorf("agent: the service-account token in %s has not rotated since it was used, and it works "+
-			"once: project it with expirationSeconds: 600 so the kubelet renews it every 8 minutes", k.path)
+		return "", fmt.Errorf("agent: the service-account token in %s has not rotated since the last sign-in tried it, and it "+
+			"works once (a sign-in that failed after sending it may have spent it): project it with expirationSeconds: 600 "+
+			"so the kubelet renews it every 8 minutes", k.path)
 	}
 	k.last = token
 	return token, nil

@@ -162,8 +162,10 @@ func NewInstance(issuer, agentID string, ev Evidence, cfg Configuration, opts ..
 //	AUTHFI_API_ORIGIN           where machine APIs are served (optional)
 //	AUTHFI_AGENT_RESOURCE       the API the agent's token is for (optional)
 //
-// Device evidence is used when AUTHFI_DEVICE_KEY_FILE is set; else the Kubernetes token when its file
-// is there. Options override nothing the environment names.
+// Device evidence is used when AUTHFI_DEVICE_KEY_FILE is set, even if a Kubernetes token is also
+// there (the Python SDK has the same order); else the Kubernetes token when its file is there.
+// Options are applied after the environment, so an option overrides the variable that names the same
+// setting.
 func NewInstanceFromEnv(opts ...Option) (*Agent, error) {
 	return newInstanceFromLookup(os.Getenv, fileExists, opts...)
 }
@@ -469,6 +471,9 @@ func parseAttestation(body []byte, agentID, jkt string, now time.Time) (*attesta
 		return nil, fmt.Errorf("the attestation lives longer than %d seconds", maxAttestationLifetime)
 	case !now.Before(time.Unix(int64(exp), 0)):
 		return nil, errors.New("the attestation has already expired (is the clock right?)")
+	case time.Unix(int64(exp), 0).Sub(now) <= renewSkew:
+		// Held with a minute or less left it would be renewed on every call.
+		return nil, errors.New("the attestation has a minute or less left (is the clock right?)")
 	}
 	return &attestation{token: authfi.NewSecret(resp.Attestation), instanceID: instID, expires: time.Unix(int64(exp), 0), jkt: jkt}, nil
 }
